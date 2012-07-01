@@ -10,6 +10,7 @@ import Queue
 
 import roslib; roslib.load_manifest('topic_bridge')
 import rospy
+import topic_bridge.srv
 
 class ROSResolver(object):
     def __init__(self):
@@ -24,11 +25,15 @@ class ROSResolver(object):
 
         return getattr(self._msgs[pkg], cls)
 
+    def is_valid_mtype(self, mtype):
+        return len(mtype) > 0 and len(mtype.split('/')) == 2
+    
 class Bridge(object):
     EXTERN_PUB = 0
     EXTERN_SUB = 1
     LOCAL_PUB = 2
     LOCAL_SUB = 3
+    SERV_REQ = 4
     
     def __init__(self):
         # TODO: Have way of purging dead addresses
@@ -66,7 +71,7 @@ class Bridge(object):
             mtype, = struct.unpack('>%ss' % mtype_len, payload[start:end])
             # rospy.loginfo('%s %s %s %s' % (topic_len, topic, mtype_len, mtype))
             return topic, mtype, payload[end:]        
-        cmd,  = struct.unpack('>I', data[0:4])
+        cmd, = struct.unpack('>I', data[0:4])
         payload = data[4:]
         topic, mtype, msg = parse_header(payload)
         
@@ -75,16 +80,36 @@ class Bridge(object):
             return
         self._queue.put((cmd, addr, topic, mtype, msg))
 
+    def service_request(self, req, resp, event):
+        self._queue.put((self.SERV_REQ, req, resp, event))
+    
+    def _local_topic_cb(self, msg):
+        # Callback for messages from local master that we're subscribed to
+        self._queue.put((self.EXTERN_PUB, msg))
+
+    #=========================== Helper functions ============================#
     def subscribe_external(self, address, topic, mtype):
         # Subscribe to a topic on another and machine and publish it locally
         self._queue.put((Bridge.EXTERN_SUB, address, topic, mtype))
 
-    def _local_topic_cb(self, msg):
-        # Callback for messages from local master that we're subscribed to
-        self._queue.put((self.EXTERN_PUB, msg))
-        
     #============================== Processing ===============================#
     # These should only get called by main loop
+
+    def _service_request(self, req, resp, event):
+        if req.action == topic_bridge.srv.TopicRequest.SUBSCRIBE:
+            # TODO:  better error checking
+            good = (self._resolver.is_valid_mtype(req.mtype) and
+                    len(req.topic) > 0 and
+                    len(req.ip) > 0)
+            if not good:
+                rospy.logwarn('Bad service request %s' % req)
+            else:
+                resp['resp'] = topic_bridge.srv.TopicResponse()
+                self.subscribe_external((req.ip, req.port), req.topic, req.mtype)
+        else:
+            rospy.logwarn('Unknown service type %s' % req.action)
+        event.set()
+    
     def _extern_sub(self, address, topic, mtype):
         # Request that an external client subscribe to a topic and forward it
         # to us
@@ -151,7 +176,7 @@ class Bridge(object):
         deser.deserialize(msg)
 
         # TODO: Maybe don't deserialize message and just publish raw packets?
-        key = (topic, mtype)        
+        key = (topic, mtype)
         # rospy.logdebug("Publishing on %s (%s)" % (topic, mtype))
         self._publishers[key].publish(deser)
         
@@ -170,7 +195,8 @@ class Bridge(object):
             dispatch = {Bridge.EXTERN_PUB: self._extern_pub,
                         Bridge.EXTERN_SUB: self._extern_sub,
                         Bridge.LOCAL_PUB: self._local_pub,
-                        Bridge.LOCAL_SUB: self._local_sub}
+                        Bridge.LOCAL_SUB: self._local_sub,
+                        Bridge.SERV_REQ: self._service_request}
 
             if key not in dispatch:
                 rospy.logwarn("Unknown type on Queue: %s" % type)
@@ -210,7 +236,14 @@ class UDPServer(asyncore.dispatcher):
             return
         else:
             self._deq.append((payload, addrs))
-        
+
+def handle_service(bridge, req):
+    resp = {'resp': None}
+    evt = threading.Event()
+    bridge.service_request(req, resp, evt)
+    evt.wait()
+    return resp['resp']
+
 if __name__ == "__main__":
     bridge = Bridge()
     server = UDPServer(8080)
@@ -222,8 +255,9 @@ if __name__ == "__main__":
     server_thread = threading.Thread(target = lambda: asyncore.loop(timeout = 0.01))
     server_thread.daemon = True
     server_thread.start()
-
+    
     rospy.init_node('topic_bridge')
+    srv = rospy.Service('~topic', topic_bridge.srv.Topic,
+                        lambda req: handle_service(bridge, req))
 
     bridge.run()
-    

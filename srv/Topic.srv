@@ -1,0 +1,8 @@
+uint8 SUBSCRIBE = 0
+
+uint8 action
+string ip     # IPv4 address
+uint16 port
+string mtype  # Message type (e.g. std_msgs/String)
+string topic
+---
