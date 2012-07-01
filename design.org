@@ -1,0 +1,38 @@
+#+TITLE:     design.org
+#+AUTHOR:    Ben Charrow
+#+EMAIL:     bcharrow@seas.upenn.edu
+#+DATE:      2012-06-28 Thu
+#+DESCRIPTION: Design goals for topic_bridge
+#+KEYWORDS: 
+#+LANGUAGE:  en
+#+OPTIONS:   H:3 num:t toc:t \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t
+#+OPTIONS:   TeX:t LaTeX:nil skip:nil d:nil todo:t pri:nil tags:not-in-toc
+#+INFOJS_OPT: view:nil toc:nil ltoc:t mouse:underline buttons:0 path:http://orgmode.org/org-info.js
+#+EXPORT_SELECT_TAGS: export
+#+EXPORT_EXCLUDE_TAGS: noexport
+#+LINK_UP:   
+#+LINK_HOME: 
+
+* Overview
+
+topic_forward enables robots on separate machines to communicate when they do
+not use the same ROS master.
+
+Each ROS master should have a single topic_bridge node. The node listens to
+specified topics via ROS' communication infrastructure, and sends messages it
+receives to other topic_bridge nodes on other ROS masters via UDP.  Upon
+receiving a message from a foreign topic_bridge, the local topic_bridge will
+broadcast the message locally via ROS' communication infrastructure.
+
+* Design notes
+
+- Because UDP is the transport protocol for communication between bridges,
+  messages may arrive out of order or not at all.
+- ROS parameters are not supported.
+- ROS services are not supported.
+- Assumes synchronized clocks between machines.
+- No service discovery.
+- Everything is implemented using rospy.  roscpp is difficult to use because it
+  has no introspection and it would require compile time specification of
+  supported types.  See ros::Subscriber, ros::Publisher,
+  ros::NodeHandle::advertise() and ros::AdvertiseOptions for more details.
