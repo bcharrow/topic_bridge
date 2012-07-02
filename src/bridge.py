@@ -7,6 +7,9 @@ import struct
 import collections
 import cStringIO as StringIO
 import Queue
+import math
+import random
+import itertools
 
 import roslib; roslib.load_manifest('topic_bridge')
 import rospy
@@ -252,11 +255,48 @@ class Client(object):
         # Sequence number of the 
         self.seqno_processed = -1
         self.last_sent = rospy.Time(0)
-    
+        # Map from nonce to ChunkedMessage
+        self.chunked_messages = {}
+
+    def get_retransmit(self, retransmit_duration, purge_duration):
+        retransmit = []
+        for nonce, cmesg in self.chunked_messages.items():
+            diff = rospy.get_rostime() - cmesg.last_added
+            if diff > purge_duration:
+                rospy.loginfo("Removing chunked message nonce=%i" % nonce)
+                del self.chunked_messages[nonce]
+            elif diff > retransmit_duration:
+                retransmit.append((nonce, cmesg))
+        return retransmit
+
+    def get_or_create_chunk(self, nonce, total):
+        if nonce not in self.chunked_messages:
+            self.chunked_messages[nonce] = ChunkedMessage(nonce, total)
+        return self.chunked_messages[nonce]
+
+class ChunkedMessage(object):
+    def __init__(self, nonce, total, chunks = None):
+        self.nonce = nonce
+        self.started = rospy.get_rostime()
+        self.last_added = rospy.Time(0)
+        if chunks is None:
+            self.chunks = [None] * total
+            self.remaining = set(xrange(0, total))
+        else:
+            self.chunks = chunks
+            assert len(chunks) == total
+            
+    def add_chunk(self, ind, chunk):
+        self.remaining.discard(ind)
+        self.chunks[ind] = chunk
+        self.last_added = rospy.get_rostime()
+
 class UDPServer(asyncore.dispatcher):
     NO_ACK = '\x00'
     NEED_ACK = '\x01'
     ACK = '\x02'
+    NO_ACK_CHUNK = '\x03'
+    RETRANSMIT = '\x04'
     
     def __init__(self, port):
         asyncore.dispatcher.__init__(self)
@@ -264,6 +304,10 @@ class UDPServer(asyncore.dispatcher):
         self.set_reuse_addr()
         self.bind(('', port))
         self._read_cb = lambda x: None
+
+        self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+        self.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+                                                            
         # deque is a thread-safe object
         
         # Send messages via UDP with no additional guarantees
@@ -272,6 +316,14 @@ class UDPServer(asyncore.dispatcher):
         self._fifo = collections.deque()
         # Map from (IP, port) to Client() objects.
         self._clients = {}
+        # Duration to wait before requesting a retransmit for recvd messages
+        self.retransmit_duration = rospy.Duration(0.05)
+        # Duration to wait before purging a partially recvd message
+        self.purge_duration = rospy.Duration(5)
+        # Sent messages that were chunked; maps from nonce to ChunkedMessage
+        self.sent_cache = {}
+        # Time to live of messages in sent_cache
+        self.sent_ttl = rospy.Duration(6)
 
     def _get_or_create_client(self, addr):
         host, port = addr
@@ -319,6 +371,33 @@ class UDPServer(asyncore.dispatcher):
                 rospy.logwarn("Got an ACK with a larger than expected seqno")
             else:
                 pass # Old sequence number
+        elif data[0] == self.NO_ACK_CHUNK:
+            nonce, ttl, ind = struct.unpack('>III', data[1:13])
+            chunk = data[13:]
+            client = self._get_or_create_client(addr)
+
+            cmesg = client.get_or_create_chunk(nonce, ttl)
+            # rospy.loginfo("Adding chunk nonce = %i ind = %i from %s" % (
+            #         nonce, ind, client.addr))
+            cmesg.add_chunk(ind, chunk)
+            if len(cmesg.remaining) == 0:
+                rospy.loginfo("Received all chunks")
+                msg = ''.join(cmesg.chunks)
+                self._read_cb(addr, msg)
+                del client.chunked_messages[nonce]
+        elif data[0] == self.RETRANSMIT:
+            nonce, num = struct.unpack(">II", data[1:9])
+            inds = struct.unpack(">%sH" % num, data[9:])
+            rospy.loginfo("Got a request to retransmit %s packets nonce = %i" %
+                          (num, nonce))
+            if nonce not in self.sent_cache:
+                rospy.logwarn("Can't resubmit packets for nonce = %i" % nonce)
+            else:
+                cmesg = self.sent_cache[nonce]
+                # TODO: error checking on inds
+                for ind in inds:
+                    payload = self.NO_ACK_CHUNK + cmesg.chunks[ind]
+                    self.sendto(payload, addr)
         else:
             rospy.logwarn('Message with invalid header packet from %s' % (addr, ))
 
@@ -326,10 +405,24 @@ class UDPServer(asyncore.dispatcher):
         # Handle regular UDP
         if len(self._deq) > 0:
             msg, addrs = self._deq.popleft()
-            # rospy.logdebug("UDP Server:: Sending data to %s" % addrs)
-            msg = self.NO_ACK + msg
-            for addr in addrs:
-                self.sendto(msg, addr)
+            if len(msg) > 1400:
+                total = int(math.ceil(len(msg) / 1400.0))
+                nonce = random.randint(0, 2**32 - 1)
+                rospy.loginfo("Sending %s bytes in %s messages nonce = %i" % (
+                        len(msg), total, nonce))
+                header = struct.pack('>II', nonce, total)
+                chunks = [header + struct.pack('>I', ind) + ''.join(chunk)
+                          for ind, chunk in enumerate(chunker(msg, 1400))]
+                self.sent_cache[nonce] = ChunkedMessage(nonce, total, chunks)
+                for chunk in chunks:
+                    payload = self.NO_ACK_CHUNK + chunk
+                    for addr in addrs:
+                        self.sendto(payload, addr)
+            else:
+                # rospy.logdebug("UDP Server:: Sending data to %s" % addrs)
+                msg = self.NO_ACK + msg
+                for addr in addrs:
+                    self.sendto(msg, addr)
                 
         # Add new reliable messages to clients
         if len(self._fifo) > 0:
@@ -342,8 +435,22 @@ class UDPServer(asyncore.dispatcher):
                 
         # Handle client needs
         for clt in self._clients.values():
+            retransmits = clt.get_retransmit(self.retransmit_duration,
+                                             self.purge_duration)
+            for nonce, cmesg in retransmits:
+                inds = list(cmesg.remaining)
+                # TODO: Handle case where this message is above MTU
+                rospy.loginfo("Requesting %i packets from %s (nonce=%i)",
+                              len(inds), clt.addr, nonce)
+                payload = (self.RETRANSMIT + struct.pack('>II', nonce, len(inds)) +
+                           struct.pack('>%sH' % len(inds), *inds))
+                # To ensure that we don't re-request packet several times,
+                # reset add time
+                cmesg.last_added = rospy.get_rostime()
+                self.sendto(payload, clt.addr)
+
+            # Nothing to do
             if len(clt.deq) == 0:
-                # Nothing to do
                 continue
             
             msg, seqno, timeout = clt.deq[0]
@@ -359,13 +466,21 @@ class UDPServer(asyncore.dispatcher):
                 # rospy.logdebug("Message to %s seqno=%i expired, resending" % (
                 #         clt.addr, seqno))
                 clt.last_sent = rospy.Time(0)
-            
+
+        # Check if any chunked messages that we've sent need to be purged
+        for nonce, chunk in self.sent_cache.items():
+            if rospy.get_rostime() - chunk.started > self.sent_ttl:
+                rospy.loginfo("Purging message nonce=%i" % nonce)
+                del self.sent_cache[nonce]
+                
     def writable(self):
-        rv = (len(self._deq) != 0 or len(self._fifo) != 0 or
-                any(len(clt.deq) > 0 and
-                    (clt.last_sent == rospy.Time(0) or
-                     rospy.get_rostime() - clt.last_sent > clt.deq[0][2])
-                    for clt in self._clients.values()))
+        rv = (len(self._deq) != 0 or
+              len(self._fifo) != 0 or
+              any(clt.get_retransmit(self.retransmit_duration, self.purge_duration) or
+                  (len(clt.deq) > 0 and
+                   (clt.last_sent == rospy.Time(0) or
+                    rospy.get_rostime() - clt.last_sent > clt.deq[0][2]))
+                  for clt in self._clients.values()))
         return rv
 
     def set_read_cb(self, cb):
@@ -373,15 +488,30 @@ class UDPServer(asyncore.dispatcher):
 
     def send_msg(self, payload, addrs, timeout = None):
         # Thread safe function to send bitstream to list of (IP, port) addrs
-        if len(payload) > 1400:
-            rospy.logwarn("Message is too big, ignoring")
-            return
+        if timeout is None:
+            self._deq.append((payload, addrs))
         else:
-            if timeout is None:
-                self._deq.append((payload, addrs))
-            else:
-                self._fifo.append((payload, addrs, timeout))
+            if len(payload) > 1400:
+                rospy.logwarn("Message is too big, ignoring")
+                return
+            
+            self._fifo.append((payload, addrs, timeout))
 
+def chunker(iterable, chunksize):
+    """
+    Return elements from the iterable in `chunksize`-ed lists. The last returned
+    chunk may be smaller (if length of collection is not divisible by `chunksize`).
+
+    >>> print list(chunker(xrange(10), 3))
+    [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
+    """
+    i = iter(iterable)
+    while True:
+        wrapped_chunk = [list(itertools.islice(i, int(chunksize)))]
+        if not wrapped_chunk[0]:
+            break
+        yield wrapped_chunk.pop()
+            
 def handle_service(bridge, req):
     resp = {'resp': None}
     evt = threading.Event()
