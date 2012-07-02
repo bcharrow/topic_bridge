@@ -364,9 +364,9 @@ def handle_service(bridge, req):
     evt.wait()
     return resp['resp']
 
-if __name__ == "__main__":
+def main(port, nameg):
     bridge = Bridge()
-    server = UDPServer(8080)
+    server = UDPServer(port)
 
     server.set_read_cb(bridge.recv_msg_cb)
 
@@ -376,8 +376,17 @@ if __name__ == "__main__":
     server_thread.daemon = True
     server_thread.start()
     
-    rospy.init_node('topic_bridge')
+    rospy.init_node(name)
     srv = rospy.Service('~topic', topic_bridge.srv.Topic,
                         lambda req: handle_service(bridge, req))
 
     bridge.run()
+
+if __name__ == "__main__":
+    import sys
+    port = int(sys.argv[1]) if sys.argv[1:] else 8080
+    name = sys.argv[2] if sys.argv[2:] else 'topic_bridge'
+    if sys.argv[2:]:
+        main(port, name)
+    else:
+        main(port, name)
