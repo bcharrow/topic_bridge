@@ -27,6 +27,31 @@ class ROSResolver(object):
 
     def is_valid_mtype(self, mtype):
         return len(mtype) > 0 and len(mtype.split('/')) == 2
+
+class SerializedMessage(object):
+    # Wrapper for serialized ROS message which acts like deserialized message
+    def __init__(self, buff):
+        self._buff = buff
+
+    def serialize(self, buff):
+        buff.write(self._buff)
+
+class SerializedPublisher(rospy.topics.Publisher):
+    def publish_serialized(self, msg):
+        if self.impl is None:
+            raise rospy.exceptions.ROSException("publish() to an unregistered() handle")
+        if not rospy.core.is_initialized():
+            raise rospy.exceptions.ROSException("ROS node has not been initialized yet. Please call init_node() first")
+
+        try:
+            self.impl.acquire()
+            self.impl.publish(msg)
+        except roslib.message.SerializationError as e:
+            # can't go to rospy.logerr(), b/c this could potentially recurse
+            rospy.topics._logger.error(traceback.format_exc(e))
+            raise rospy.exceptions.ROSSerializationException(str(e))
+        finally:
+            self.impl.release()
     
 class Bridge(object):
     EXTERN_PUB = 0
@@ -122,7 +147,7 @@ class Bridge(object):
 
             mtype_cls = self._resolver.get_msg_class(mtype)
         
-            self._publishers[key] = rospy.Publisher(topic, mtype_cls)
+            self._publishers[key] = SerializedPublisher(topic, mtype_cls)
         
         enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
                           Bridge.LOCAL_SUB, len(topic), topic, len(mtype), mtype)
@@ -169,14 +194,10 @@ class Bridge(object):
         
     def _local_pub(self, addr, topic, mtype, msg):
         # Publish a message locally from an external master
-        mtype_cls = self._resolver.get_msg_class(mtype)
-        deser = mtype_cls()
-        deser.deserialize(msg)
-
-        # TODO: Maybe don't deserialize message and just publish raw packets?
+        smesg = SerializedMessage(msg)
         key = (topic, mtype)
         # rospy.logdebug("Publishing on %s (%s)" % (topic, mtype))
-        self._publishers[key].publish(deser)
+        self._publishers[key].publish_serialized(smesg)
         
     #=============================== Main loop ===============================#
     def run(self, timeout = 0.5):
