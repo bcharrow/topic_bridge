@@ -39,12 +39,11 @@ class Bridge(object):
         # TODO: Have way of purging dead addresses
         self._subscriptions = {}
         self._publishers = {}
-        # Thread-safe callback function to send messages with
-        self._send = lambda (x, y): None
+        # Thread-safe callback functions to send messages with
+        self._send = None
         # Queue to process commands to subscribe / publish a message
         self._queue = Queue.Queue()
-
-        # Not a thread safe object
+        # Used to resolve ROS names; not thread safe
         self._resolver = ROSResolver()
 
     def set_send(self, f):
@@ -69,7 +68,7 @@ class Bridge(object):
             start += 4
             end += mtype_len
             mtype, = struct.unpack('>%ss' % mtype_len, payload[start:end])
-            # rospy.loginfo('%s %s %s %s' % (topic_len, topic, mtype_len, mtype))
+            # rospy.logdebug('%s %s %s %s' % (topic_len, topic, mtype_len, mtype))
             return topic, mtype, payload[end:]        
         cmd, = struct.unpack('>I', data[0:4])
         payload = data[4:]
@@ -117,18 +116,17 @@ class Bridge(object):
         if key in self._publishers:
             rospy.loginfo("Local publisher for %s (%s) from %s already exists" % (
                     topic, mtype, address))
-            return
-        
-        rospy.loginfo("Creating local publisher for %s (%s) from %s" % (
-                topic, mtype, address))
+        else:
+            rospy.loginfo("Creating local publisher for %s (%s) from %s" % (
+                    topic, mtype, address))
 
-        mtype_cls = self._resolver.get_msg_class(mtype)
+            mtype_cls = self._resolver.get_msg_class(mtype)
         
-        self._publishers[key] = rospy.Publisher(topic, mtype_cls)
+            self._publishers[key] = rospy.Publisher(topic, mtype_cls)
         
         enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
                           Bridge.LOCAL_SUB, len(topic), topic, len(mtype), mtype)
-        self._send(enc, [address])
+        self._send(enc, [address], rospy.Duration(5))
 
     def _extern_pub(self, msg):
         # Publish a message on an external machine
@@ -181,7 +179,7 @@ class Bridge(object):
         self._publishers[key].publish(deser)
         
     #=============================== Main loop ===============================#
-    def run(self, timeout = 0.25):
+    def run(self, timeout = 0.5):
         # Main event loop.  Get items off of queue and process them.
         while not rospy.is_shutdown():
             try:
@@ -203,7 +201,21 @@ class Bridge(object):
             else:
                 dispatch[key](*args)
 
+class Client(object):
+    def __init__(self, addr):
+        self.addr = addr
+        # Sequence number of the item at the head of self._deq
+        self.seqno = -1
+        self.deq = collections.deque()
+        # Sequence number of the 
+        self.seqno_processed = -1
+        self.last_sent = rospy.Time(0)
+    
 class UDPServer(asyncore.dispatcher):
+    NO_ACK = '\x00'
+    NEED_ACK = '\x01'
+    ACK = '\x02'
+    
     def __init__(self, port):
         asyncore.dispatcher.__init__(self)
         self.create_socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -211,31 +223,118 @@ class UDPServer(asyncore.dispatcher):
         self.bind(('', port))
         self._read_cb = lambda x: None
         # deque is a thread-safe object
-        self._deq = collections.deque()
         
+        # Send messages via UDP with no additional guarantees
+        self._deq = collections.deque()
+        # Queue for requests to Client objects
+        self._fifo = collections.deque()
+        # Map from (IP, port) to Client() objects.
+        self._clients = {}
+
+    def _get_or_create_client(self, addr):
+        host, port = addr
+        ip = socket.gethostbyname(host)
+        return self._clients.setdefault((ip, port), Client((ip, port)))
+
+    def _get_client(self, addr):
+        host, port = addr
+        ip = socket.gethostbyname(host)
+        return self._clients[(ip, port)]
+    
     def handle_read(self):
         data, addr = self.recvfrom(1400)
-        self._read_cb(addr, data)
-        
-    def handle_write(self):
-        msg, addrs = self._deq.popleft()
-        # rospy.logdebug("UDP Server:: Sending data to %s" % addrs)
-        for addr in addrs:
-            self.sendto(msg, addr)
+        if data[0] == self.NO_ACK:
+            # rospy.logdebug("NO ACK: %s", data[1:])
+            self._read_cb(addr, data[1:])
+        elif data[0] == self.NEED_ACK:
+            # Check if we've already processed this
+            seqno, = struct.unpack('>I', data[1:5])
+            client = self._get_or_create_client(addr)
+            rospy.logdebug("Got message from %s seqno=%s" % (
+                    client.addr, seqno))
+            if client.seqno_processed + 1 == seqno:
+                rospy.logdebug("Processing message")
+                self._read_cb(addr, data[5:])
+                client.seqno_processed = seqno
+            # Send ACK
+            # rospy.logdebug("Sending ACK %s to %s" % (
+            #         struct.unpack('>I', data[1:5])[0], addr))
+            self.sendto(self.ACK + data[1:5], addr)
+        elif data[0] == self.ACK:
+            # Acknowledge that we got an ACK
+            seqno, = struct.unpack('>I', data[1:5])
+            client = self._get_client(addr)
+            if client.deq[0][1] == seqno:
+                # rospy.logdebug("Got ACK from %s on seqno=%i" % (
+                #         client.addr, seqno))
+                client.deq.popleft()
+                client.last_sent = rospy.Time(0)
+            elif client.seqno < seqno:
+                rospy.logwarn("Got an ACK with a larger than expected seqno")
+            else:
+                pass # Old sequence number
+        else:
+            rospy.logwarn('Message with invalid header packet from %s' % (addr, ))
 
+    def handle_write(self):
+        # Handle regular UDP
+        if len(self._deq) > 0:
+            msg, addrs = self._deq.popleft()
+            # rospy.logdebug("UDP Server:: Sending data to %s" % addrs)
+            msg = self.NO_ACK + msg
+            for addr in addrs:
+                self.sendto(msg, addr)
+                
+        # Add new reliable messages to clients
+        if len(self._fifo) > 0:
+            msg, addrs, timeout = self._fifo.popleft()
+            for addr in addrs:
+                clt = self._get_or_create_client(addr)
+                # rospy.logdebug("Enqueueing message for %s" % (clt.addr, ))
+                clt.seqno += 1
+                clt.deq.append((msg, clt.seqno, timeout))
+                
+        # Handle client needs
+        for clt in self._clients.values():
+            if len(clt.deq) == 0:
+                # Nothing to do
+                continue
+            
+            msg, seqno, timeout = clt.deq[0]
+            if clt.last_sent == rospy.Time(0):
+                # Send message
+                # rospy.logdebug("Sending message to %s seqno=%i" % (
+                #         clt.addr, seqno))
+                payload = self.NEED_ACK + struct.pack('>I', seqno) + msg
+                self.sendto(payload, clt.addr)
+                clt.last_sent = rospy.get_rostime()
+            elif rospy.get_rostime() - clt.last_sent > timeout:
+                # No ACK for message; resend
+                # rospy.logdebug("Message to %s seqno=%i expired, resending" % (
+                #         clt.addr, seqno))
+                clt.last_sent = rospy.Time(0)
+            
     def writable(self):
-        return len(self._deq) != 0
+        rv = (len(self._deq) != 0 or len(self._fifo) != 0 or
+                any(len(clt.deq) > 0 and
+                    (clt.last_sent == rospy.Time(0) or
+                     rospy.get_rostime() - clt.last_sent > clt.deq[0][2])
+                    for clt in self._clients.values()))
+        return rv
 
     def set_read_cb(self, cb):
         self._read_cb = cb
 
-    def send_msg(self, payload, addrs):
+    def send_msg(self, payload, addrs, timeout = None):
         # Thread safe function to send bitstream to list of (IP, port) addrs
         if len(payload) > 1400:
             rospy.logwarn("Message is too big, ignoring")
             return
         else:
-            self._deq.append((payload, addrs))
+            if timeout is None:
+                self._deq.append((payload, addrs))
+            else:
+                self._fifo.append((payload, addrs, timeout))
 
 def handle_service(bridge, req):
     resp = {'resp': None}
