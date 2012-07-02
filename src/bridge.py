@@ -36,6 +36,11 @@ class SerializedMessage(object):
     def serialize(self, buff):
         buff.write(self._buff)
 
+def deserialize_noop(self, buf):
+    # Method to override default deserialize function for message objects
+    self.serialized = buf
+    return self
+        
 class SerializedPublisher(rospy.topics.Publisher):
     def publish_serialized(self, msg):
         if self.impl is None:
@@ -70,7 +75,9 @@ class Bridge(object):
         self._queue = Queue.Queue()
         # Used to resolve ROS names; not thread safe
         self._resolver = ROSResolver()
-
+        # Map names of dynamiaclly created classes to the classes themselves
+        self._classes = {}
+        
     def set_send(self, f):
         # Set method used to send packets to external clients
         self._send = f
@@ -147,7 +154,7 @@ class Bridge(object):
 
             mtype_cls = self._resolver.get_msg_class(mtype)
         
-            self._publishers[key] = SerializedPublisher(topic, mtype_cls)
+            self._publishers[key] = SerializedPublisher(topic + '4', mtype_cls)
         
         enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
                           Bridge.LOCAL_SUB, len(topic), topic, len(mtype), mtype)
@@ -155,14 +162,13 @@ class Bridge(object):
 
     def _extern_pub(self, msg):
         # Publish a message on an external machine
-        buff = StringIO.StringIO()
         mtype = msg._connection_header['type']
         topic = msg._connection_header['topic']
         key = (topic, mtype)
         
-        msg.serialize(buff)
-        ser = buff.getvalue()
-
+        # msg.serialize(buff)
+        # ser = buff.getvalue()
+        ser = msg.serialized
         dests = self._subscriptions[key][1]
 
         msg = struct.pack('>II%ssI%ss%ss' % (len(topic), len(mtype), len(ser)),
@@ -177,11 +183,19 @@ class Bridge(object):
         if key not in self._subscriptions:
             rospy.loginfo("Subscribing %s to %s (%s)" % (addr, topic, mtype))
 
-            mtype_class = self._resolver.get_msg_class(mtype)
+            mclass = self._resolver.get_msg_class(mtype)
 
+            clsname  = ''.join([mclass.__module__, '.', mclass.__name__])
+            if clsname not in self._classes:
+                # Create new class with special deserialize() method in local
+                # namespace.  Prepend base class' module name so that if the
+                # ROS names don't collide, neither will these.
+                cls = type(clsname, (mclass, ), {'deserialize': deserialize_noop})
+                self._classes[clsname] = cls
+            cls = self._classes[clsname]
+                
             self._subscriptions[key] = (
-                rospy.Subscriber(topic, mtype_class, self._local_topic_cb),
-                [addr])
+                rospy.Subscriber(topic, cls, self._local_topic_cb), [addr])
         else:
             sub, addrs = self._subscriptions[key]
             # TODO: verify that mtype matches
@@ -386,7 +400,4 @@ if __name__ == "__main__":
     import sys
     port = int(sys.argv[1]) if sys.argv[1:] else 8080
     name = sys.argv[2] if sys.argv[2:] else 'topic_bridge'
-    if sys.argv[2:]:
-        main(port, name)
-    else:
-        main(port, name)
+    main(port, name)
