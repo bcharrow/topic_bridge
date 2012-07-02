@@ -211,6 +211,13 @@ class Bridge(object):
         smesg = SerializedMessage(msg)
         key = (topic, mtype)
         # rospy.logdebug("Publishing on %s (%s)" % (topic, mtype))
+        
+        # There may not be a publisher for the message if we asked an external
+        # master to send messages to us, died, and then came back.
+        if key not in self._publishers:
+            mtype_cls = self._resolver.get_msg_class(mtype)
+            self._publishers[key] = SerializedPublisher(topic + '4', mtype_cls)
+
         self._publishers[key].publish_serialized(smesg)
         
     #=============================== Main loop ===============================#
@@ -278,6 +285,8 @@ class UDPServer(asyncore.dispatcher):
     
     def handle_read(self):
         data, addr = self.recvfrom(1400)
+        # rospy.loginfo("Got data from %s" % (addr, ))
+
         if data[0] == self.NO_ACK:
             # rospy.logdebug("NO ACK: %s", data[1:])
             self._read_cb(addr, data[1:])
@@ -285,8 +294,10 @@ class UDPServer(asyncore.dispatcher):
             # Check if we've already processed this
             seqno, = struct.unpack('>I', data[1:5])
             client = self._get_or_create_client(addr)
-            rospy.logdebug("Got message from %s seqno=%s" % (
-                    client.addr, seqno))
+            # rospy.logdebug("Got message from %s seqno=%s" % (
+            #         client.addr, seqno))
+            if client.seqno_processed == -1:
+                client.seqno_processed = seqno - 1
             if client.seqno_processed + 1 == seqno:
                 rospy.logdebug("Processing message")
                 self._read_cb(addr, data[5:])
