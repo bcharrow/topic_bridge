@@ -10,6 +10,7 @@ import Queue
 import math
 import random
 import itertools
+import time
 
 import roslib; roslib.load_manifest('topic_bridge')
 import rospy
@@ -161,7 +162,7 @@ class Bridge(object):
         
         enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
                           Bridge.LOCAL_SUB, len(topic), topic, len(mtype), mtype)
-        self._send(enc, [address], rospy.Duration(5))
+        self._send(enc, [address], 5.0)
 
     def _extern_pub(self, msg):
         # Publish a message on an external machine
@@ -254,25 +255,25 @@ class Client(object):
         self.deq = collections.deque()
         # Sequence number of the 
         self.seqno_processed = -1
-        self.last_sent = rospy.Time(0)
+        self.last_sent = 0
         # Map from nonce to ChunkedMessage
         self.chunked_messages = {}
         # Nonces to ignore
         self.black_list_expire = collections.deque()
         self.black_list = set()
-        self.black_list_ttl = rospy.Duration(10)
+        self.black_list_ttl = 10.0
 
     def get_retransmit(self, retransmit_duration, purge_duration):
         retransmit = []
         for nonce, cmesg in self.chunked_messages.items():
-            now = rospy.get_rostime()
+            now = time.time()
             if nonce in self.black_list or (now - cmesg.started > purge_duration):
                 self.del_msg(nonce)
             elif now - cmesg.last_added > retransmit_duration:
                 retransmit.append((nonce, cmesg))
         # Check if any nonce's are OK to use again
         while self.black_list_expire:
-            now = rospy.get_rostime()
+            now = time.time()
             nonce, started = self.black_list_expire[0]
             if now - started > self.black_list_ttl:
                 self.black_list_expire.popleft()
@@ -294,13 +295,13 @@ class Client(object):
         #         (nonce, len(self.chunked_messages[nonce].remaining))))
         del self.chunked_messages[nonce]
         self.black_list.add(nonce)
-        self.black_list_expire.append((nonce, rospy.get_rostime()))
+        self.black_list_expire.append((nonce, time.time()))
 
 class ChunkedMessage(object):
     def __init__(self, nonce, total, chunks = None):
         self.nonce = nonce
-        self.started = rospy.get_rostime()
-        self.last_added = rospy.Time(0)
+        self.started = time.time()
+        self.last_added = 0
         if chunks is None:
             self.chunks = [None] * total
             self.remaining = set(xrange(0, total))
@@ -312,7 +313,7 @@ class ChunkedMessage(object):
     def add_chunk(self, ind, chunk):
         self.remaining.discard(ind)
         self.chunks[ind] = chunk
-        self.last_added = rospy.get_rostime()
+        self.last_added = time.time()
 
 class UDPServer(asyncore.dispatcher):
     NO_ACK = '\x00'
@@ -340,13 +341,13 @@ class UDPServer(asyncore.dispatcher):
         # Map from (IP, port) to Client() objects.
         self._clients = {}
         # Duration to wait before requesting a retransmit for recvd messages
-        self.retransmit_duration = rospy.Duration(0.05)
+        self.retransmit_duration = 0.05
         # Duration to wait before purging a partially recvd message
-        self.purge_duration = rospy.Duration(3)
+        self.purge_duration = 3.0
         # Sent messages that were chunked; maps from nonce to ChunkedMessage
         self.sent_cache = {}
         # Time to live of messages in sent_cache
-        self.sent_ttl = rospy.Duration(5)
+        self.sent_ttl = 5.0
 
     def _get_or_create_client(self, addr):
         host, port = addr
@@ -389,7 +390,7 @@ class UDPServer(asyncore.dispatcher):
                 # rospy.logdebug("Got ACK from %s on seqno=%i" % (
                 #         client.addr, seqno))
                 client.deq.popleft()
-                client.last_sent = rospy.Time(0)
+                client.last_sent = 0
             elif client.seqno < seqno:
                 rospy.logwarn("Got an ACK with a larger than expected seqno")
             else:
@@ -434,8 +435,8 @@ class UDPServer(asyncore.dispatcher):
             if len(msg) > 1400:
                 total = int(math.ceil(len(msg) / 1400.0))
                 nonce = random.randint(0, 2**32 - 1)
-                rospy.loginfo("Sending %s bytes in %s messages nonce = %i" % (
-                        len(msg), total, nonce))
+                # rospy.loginfo("Sending %s bytes in %s messages nonce = %i" % (
+                #         len(msg), total, nonce))
                 header = struct.pack('>II', nonce, total)
                 chunks = [header + struct.pack('>I', ind) + ''.join(chunk)
                           for ind, chunk in enumerate(chunker(msg, 1400))]
@@ -474,7 +475,7 @@ class UDPServer(asyncore.dispatcher):
                     self.sendto(payload, clt.addr)
                 # To ensure that we don't re-request packet several times,
                 # reset add time
-                cmesg.last_added = rospy.get_rostime()
+                cmesg.last_added = time.time()
                 
 
             # Nothing to do
@@ -482,32 +483,33 @@ class UDPServer(asyncore.dispatcher):
                 continue
             
             msg, seqno, timeout = clt.deq[0]
-            if clt.last_sent == rospy.Time(0):
+            if clt.last_sent == 0:
                 # Send message
                 # rospy.logdebug("Sending message to %s seqno=%i" % (
                 #         clt.addr, seqno))
                 payload = self.NEED_ACK + struct.pack('>I', seqno) + msg
                 self.sendto(payload, clt.addr)
-                clt.last_sent = rospy.get_rostime()
-            elif rospy.get_rostime() - clt.last_sent > timeout:
+                clt.last_sent = time.time()
+            elif time.time() - clt.last_sent > timeout:
                 # No ACK for message; resend
                 # rospy.logdebug("Message to %s seqno=%i expired, resending" % (
                 #         clt.addr, seqno))
-                clt.last_sent = rospy.Time(0)
+                clt.last_sent = 0
 
         # Check if any chunked messages that we've sent need to be purged
         for nonce, chunk in self.sent_cache.items():
-            if rospy.get_rostime() - chunk.started > self.sent_ttl:
-                rospy.loginfo("Purging message nonce=%i" % nonce)
+            if time.time() - chunk.started > self.sent_ttl:
+                # rospy.loginfo("Purging message nonce=%i" % nonce)
                 del self.sent_cache[nonce]
                 
     def writable(self):
+        now = time.time()
         rv = (len(self._deq) != 0 or
               len(self._fifo) != 0 or
               any(clt.get_retransmit(self.retransmit_duration, self.purge_duration) or
                   (len(clt.deq) > 0 and
-                   (clt.last_sent == rospy.Time(0) or
-                    rospy.get_rostime() - clt.last_sent > clt.deq[0][2]))
+                   (clt.last_sent == 0 or
+                    now - clt.last_sent > clt.deq[0][2]))
                   for clt in self._clients.values()))
         return rv
 
