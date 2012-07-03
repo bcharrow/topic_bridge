@@ -328,7 +328,7 @@ class UDPServer(asyncore.dispatcher):
         self.bind(('', port))
         self._read_cb = lambda x: None
 
-        self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+        self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
         self.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
                                                             
         # deque is a thread-safe object
@@ -342,11 +342,11 @@ class UDPServer(asyncore.dispatcher):
         # Duration to wait before requesting a retransmit for recvd messages
         self.retransmit_duration = rospy.Duration(0.05)
         # Duration to wait before purging a partially recvd message
-        self.purge_duration = rospy.Duration(5)
+        self.purge_duration = rospy.Duration(3)
         # Sent messages that were chunked; maps from nonce to ChunkedMessage
         self.sent_cache = {}
         # Time to live of messages in sent_cache
-        self.sent_ttl = rospy.Duration(6)
+        self.sent_ttl = rospy.Duration(5)
 
     def _get_or_create_client(self, addr):
         host, port = addr
@@ -555,7 +555,7 @@ def main(port, nameg):
 
     bridge.set_send(server.send_msg)
     
-    server_thread = threading.Thread(target = lambda: asyncore.loop(timeout = 0.01))
+    server_thread = threading.Thread(target = lambda: asyncore.loop(timeout = 0.001))
     server_thread.daemon = True
     server_thread.start()
     
