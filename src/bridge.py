@@ -157,7 +157,7 @@ class Bridge(object):
 
             mtype_cls = self._resolver.get_msg_class(mtype)
         
-            self._publishers[key] = SerializedPublisher(topic + '4', mtype_cls)
+            self._publishers[key] = SerializedPublisher(topic, mtype_cls)
         
         enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
                           Bridge.LOCAL_SUB, len(topic), topic, len(mtype), mtype)
@@ -219,7 +219,7 @@ class Bridge(object):
         # master to send messages to us, died, and then came back.
         if key not in self._publishers:
             mtype_cls = self._resolver.get_msg_class(mtype)
-            self._publishers[key] = SerializedPublisher(topic + '4', mtype_cls)
+            self._publishers[key] = SerializedPublisher(topic, mtype_cls)
 
         self._publishers[key].publish_serialized(smesg)
         
@@ -439,15 +439,17 @@ class UDPServer(asyncore.dispatcher):
                                              self.purge_duration)
             for nonce, cmesg in retransmits:
                 inds = list(cmesg.remaining)
-                # TODO: Handle case where this message is above MTU
                 rospy.loginfo("Requesting %i packets from %s (nonce=%i)",
                               len(inds), clt.addr, nonce)
-                payload = (self.RETRANSMIT + struct.pack('>II', nonce, len(inds)) +
-                           struct.pack('>%sH' % len(inds), *inds))
+                # Make sure each payload is below MTU
+                for chunk in chunker(inds, 695):
+                    payload = (self.RETRANSMIT + struct.pack('>II', nonce, len(chunk)) +
+                               struct.pack('>%sH' % len(chunk), *chunk))
+                    self.sendto(payload, clt.addr)
                 # To ensure that we don't re-request packet several times,
                 # reset add time
                 cmesg.last_added = rospy.get_rostime()
-                self.sendto(payload, clt.addr)
+                
 
             # Nothing to do
             if len(clt.deq) == 0:
