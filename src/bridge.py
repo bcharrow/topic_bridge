@@ -257,22 +257,44 @@ class Client(object):
         self.last_sent = rospy.Time(0)
         # Map from nonce to ChunkedMessage
         self.chunked_messages = {}
+        # Nonces to ignore
+        self.black_list_expire = collections.deque()
+        self.black_list = set()
+        self.black_list_ttl = rospy.Duration(10)
 
     def get_retransmit(self, retransmit_duration, purge_duration):
         retransmit = []
         for nonce, cmesg in self.chunked_messages.items():
-            diff = rospy.get_rostime() - cmesg.last_added
-            if diff > purge_duration:
-                rospy.loginfo("Removing chunked message nonce=%i" % nonce)
-                del self.chunked_messages[nonce]
-            elif diff > retransmit_duration:
+            now = rospy.get_rostime()
+            if nonce in self.black_list or (now - cmesg.started > purge_duration):
+                self.del_msg(nonce)
+            elif now - cmesg.last_added > retransmit_duration:
                 retransmit.append((nonce, cmesg))
+        # Check if any nonce's are OK to use again
+        while self.black_list_expire:
+            now = rospy.get_rostime()
+            nonce, started = self.black_list_expire[0]
+            if now - started > self.black_list_ttl:
+                self.black_list_expire.popleft()
+                self.black_list.remove(nonce)
+            else:
+                break
         return retransmit
 
     def get_or_create_chunk(self, nonce, total):
-        if nonce not in self.chunked_messages:
+        if nonce in self.black_list:
+            return None
+        elif nonce not in self.chunked_messages:
+            # rospy.loginfo("Creating chunked message nonce=%i" % nonce)
             self.chunked_messages[nonce] = ChunkedMessage(nonce, total)
         return self.chunked_messages[nonce]
+
+    def del_msg(self, nonce):
+        # rospy.loginfo("Removing chunked message nonce=%i, %s are missing" % (
+        #         (nonce, len(self.chunked_messages[nonce].remaining))))
+        del self.chunked_messages[nonce]
+        self.black_list.add(nonce)
+        self.black_list_expire.append((nonce, rospy.get_rostime()))
 
 class ChunkedMessage(object):
     def __init__(self, nonce, total, chunks = None):
@@ -284,6 +306,7 @@ class ChunkedMessage(object):
             self.remaining = set(xrange(0, total))
         else:
             self.chunks = chunks
+            self.remaining = set([])
             assert len(chunks) == total
             
     def add_chunk(self, ind, chunk):
@@ -372,26 +395,29 @@ class UDPServer(asyncore.dispatcher):
             else:
                 pass # Old sequence number
         elif data[0] == self.NO_ACK_CHUNK:
-            nonce, ttl, ind = struct.unpack('>III', data[1:13])
+            nonce, total, ind = struct.unpack('>III', data[1:13])
             chunk = data[13:]
             client = self._get_or_create_client(addr)
 
-            cmesg = client.get_or_create_chunk(nonce, ttl)
+            cmesg = client.get_or_create_chunk(nonce, total)
+            if cmesg is None:
+                return
             # rospy.loginfo("Adding chunk nonce = %i ind = %i from %s" % (
             #         nonce, ind, client.addr))
             cmesg.add_chunk(ind, chunk)
             if len(cmesg.remaining) == 0:
-                rospy.loginfo("Received all chunks")
+                # rospy.loginfo("Received all chunks for %i" % nonce)
                 msg = ''.join(cmesg.chunks)
                 self._read_cb(addr, msg)
-                del client.chunked_messages[nonce]
+                client.del_msg(nonce)
         elif data[0] == self.RETRANSMIT:
             nonce, num = struct.unpack(">II", data[1:9])
             inds = struct.unpack(">%sH" % num, data[9:])
-            rospy.loginfo("Got a request to retransmit %s packets nonce = %i" %
-                          (num, nonce))
+            # rospy.loginfo("Got a request to retransmit %s packets nonce = %i" %
+            #               (num, nonce))
             if nonce not in self.sent_cache:
-                rospy.logwarn("Can't resubmit packets for nonce = %i" % nonce)
+                rospy.logwarn("Can't resubmit packets for nonce=%i, message purged" %
+                              nonce)
             else:
                 cmesg = self.sent_cache[nonce]
                 # TODO: error checking on inds
