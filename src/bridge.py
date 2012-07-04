@@ -358,73 +358,85 @@ class UDPServer(asyncore.dispatcher):
         host, port = addr
         ip = socket.gethostbyname(host)
         return self._clients[(ip, port)]
+
+    def _read_need_ack(self, data, addr):
+        # Check if we've already processed this
+        seqno, = struct.unpack('>I', data[1:5])
+        client = self._get_or_create_client(addr)
+        # rospy.logdebug("Got message from %s seqno=%s" % (
+        #         client.addr, seqno))
+        if client.seqno_processed == -1:
+            client.seqno_processed = seqno - 1
+        if client.seqno_processed + 1 == seqno:
+            rospy.logdebug("Processing message")
+            self._read_cb(addr, data[5:])
+            client.seqno_processed = seqno
+        # Send ACK
+        # rospy.logdebug("Sending ACK %s to %s" % (
+        #         struct.unpack('>I', data[1:5])[0], addr))
+        self.sendto(self.ACK + data[1:5], addr)
+
+    def _read_ack(self, data, addr):
+        # Acknowledge that we got an ACK
+        seqno, = struct.unpack('>I', data[1:5])
+        client = self._get_client(addr)
+        if client.deq[0][1] == seqno:
+            # rospy.logdebug("Got ACK from %s on seqno=%i" % (
+            #         client.addr, seqno))
+            client.deq.popleft()
+            client.last_sent = 0
+        elif client.seqno < seqno:
+            rospy.logwarn("Got an ACK with a larger than expected seqno")
+        else:
+            pass # Old sequence number
+
+    def _read_no_ack_chunk(self, data, addr):
+        nonce, total, ind = struct.unpack('>III', data[1:13])
+        chunk = data[13:]
+        client = self._get_or_create_client(addr)
+
+        cmesg = client.get_or_create_chunk(nonce, total)
+        if cmesg is None:
+            return
+        # rospy.loginfo("Adding chunk nonce = %i ind = %i from %s" % (
+        #         nonce, ind, client.addr))
+        cmesg.add_chunk(ind, chunk)
+        if len(cmesg.remaining) == 0:
+            # rospy.loginfo("Received all chunks for %i" % nonce)
+            msg = ''.join(cmesg.chunks)
+            self._read_cb(addr, msg)
+            client.del_msg(nonce)
+
+    def _read_transmit(self, data, addr):
+        nonce, num = struct.unpack(">II", data[1:9])
+        inds = struct.unpack(">%sH" % num, data[9:])
+        # rospy.loginfo("Got a request to retransmit %s packets nonce = %i" %
+        #               (num, nonce))
+        if nonce not in self.sent_cache:
+            rospy.logwarn("Can't resubmit packets for nonce=%i, message purged" %
+                          nonce)
+        else:
+            cmesg = self.sent_cache[nonce]
+            # TODO: error checking on inds
+            for ind in inds:
+                payload = self.NO_ACK_CHUNK + cmesg.chunks[ind]
+                self.sendto(payload, addr)
     
     def handle_read(self):
         data, addr = self.recvfrom(1400)
         # rospy.loginfo("Got data from %s" % (addr, ))
 
-        if data[0] == self.NO_ACK:
+        if data[0] == self.NO_ACK_CHUNK:
+            self._read_no_ack_chunk(data, addr)
+        elif data[0] == self.NO_ACK:
             # rospy.logdebug("NO ACK: %s", data[1:])
             self._read_cb(addr, data[1:])
         elif data[0] == self.NEED_ACK:
-            # Check if we've already processed this
-            seqno, = struct.unpack('>I', data[1:5])
-            client = self._get_or_create_client(addr)
-            # rospy.logdebug("Got message from %s seqno=%s" % (
-            #         client.addr, seqno))
-            if client.seqno_processed == -1:
-                client.seqno_processed = seqno - 1
-            if client.seqno_processed + 1 == seqno:
-                rospy.logdebug("Processing message")
-                self._read_cb(addr, data[5:])
-                client.seqno_processed = seqno
-            # Send ACK
-            # rospy.logdebug("Sending ACK %s to %s" % (
-            #         struct.unpack('>I', data[1:5])[0], addr))
-            self.sendto(self.ACK + data[1:5], addr)
+            self._read_need_ack(data, addr)
         elif data[0] == self.ACK:
-            # Acknowledge that we got an ACK
-            seqno, = struct.unpack('>I', data[1:5])
-            client = self._get_client(addr)
-            if client.deq[0][1] == seqno:
-                # rospy.logdebug("Got ACK from %s on seqno=%i" % (
-                #         client.addr, seqno))
-                client.deq.popleft()
-                client.last_sent = 0
-            elif client.seqno < seqno:
-                rospy.logwarn("Got an ACK with a larger than expected seqno")
-            else:
-                pass # Old sequence number
-        elif data[0] == self.NO_ACK_CHUNK:
-            nonce, total, ind = struct.unpack('>III', data[1:13])
-            chunk = data[13:]
-            client = self._get_or_create_client(addr)
-
-            cmesg = client.get_or_create_chunk(nonce, total)
-            if cmesg is None:
-                return
-            # rospy.loginfo("Adding chunk nonce = %i ind = %i from %s" % (
-            #         nonce, ind, client.addr))
-            cmesg.add_chunk(ind, chunk)
-            if len(cmesg.remaining) == 0:
-                # rospy.loginfo("Received all chunks for %i" % nonce)
-                msg = ''.join(cmesg.chunks)
-                self._read_cb(addr, msg)
-                client.del_msg(nonce)
+            self._read_ack(data, addr)
         elif data[0] == self.RETRANSMIT:
-            nonce, num = struct.unpack(">II", data[1:9])
-            inds = struct.unpack(">%sH" % num, data[9:])
-            # rospy.loginfo("Got a request to retransmit %s packets nonce = %i" %
-            #               (num, nonce))
-            if nonce not in self.sent_cache:
-                rospy.logwarn("Can't resubmit packets for nonce=%i, message purged" %
-                              nonce)
-            else:
-                cmesg = self.sent_cache[nonce]
-                # TODO: error checking on inds
-                for ind in inds:
-                    payload = self.NO_ACK_CHUNK + cmesg.chunks[ind]
-                    self.sendto(payload, addr)
+            self._read_transmit(data, addr)
         else:
             rospy.logwarn('Message with invalid header packet from %s' % (addr, ))
 
