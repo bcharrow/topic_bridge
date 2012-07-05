@@ -36,3 +36,19 @@ broadcast the message locally via ROS' communication infrastructure.
   has no introspection and it would require compile time specification of
   supported types.  See ros::Subscriber, ros::Publisher,
   ros::NodeHandle::advertise() and ros::AdvertiseOptions for more details.
+
+* Mesh notes
+I've measured the following on a mesh 802.11S network using the Scarabs.
+
+- Ping time between two bots is ~2ms.
+- When transferring a file frome one scarab to another via scp, the max data
+  rate is 2.8 MB/s and about 30% of the CPU is used.
+- If you send zeros via UDP from one scarab to another via netcat, the max data
+  rate is 3.3 MB/s, but it occasionally drops to 2.2 MB/s.  This is due to
+  small default send / receive UDP buffer sizes.  At these rates, the sender
+  has ~4% CPU utilization, while the receiver has ~2% utilization.
+
+  Sender command: cat /dev/zero | netcat -u 192.168.130.28 8080
+  Receiver command: netcat -l -u -p 8080 | pv > /dev/null
+
+  Check dropped UDP packets: netstat -su
