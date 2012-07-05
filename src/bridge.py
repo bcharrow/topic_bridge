@@ -12,9 +12,13 @@ import random
 import itertools
 import time
 
+import snappy
+
 import roslib; roslib.load_manifest('topic_bridge')
 import rospy
 import topic_bridge.srv
+
+MTU = 1400
 
 class ROSResolver(object):
     def __init__(self):
@@ -403,7 +407,8 @@ class UDPServer(asyncore.dispatcher):
         cmesg.add_chunk(ind, chunk)
         if len(cmesg.remaining) == 0:
             # rospy.loginfo("Received all chunks for %i" % nonce)
-            msg = ''.join(cmesg.chunks)
+            comp = ''.join(cmesg.chunks)
+            msg = snappy.decompress(comp)
             self._read_cb(addr, msg)
             client.del_msg(nonce)
 
@@ -423,9 +428,9 @@ class UDPServer(asyncore.dispatcher):
                 self.sendto(payload, addr)
     
     def handle_read(self):
-        data, addr = self.recvfrom(1400)
+        # 64KB is max UDP packet size
+        data, addr = self.recvfrom(64 * 1024)
         # rospy.loginfo("Got data from %s" % (addr, ))
-
         if data[0] == self.NO_ACK_CHUNK:
             self._read_no_ack_chunk(data, addr)
         elif data[0] == self.NO_ACK:
@@ -444,14 +449,15 @@ class UDPServer(asyncore.dispatcher):
         # Handle regular UDP
         if len(self._deq) > 0:
             msg, addrs = self._deq.popleft()
-            if len(msg) > 1400:
-                total = int(math.ceil(len(msg) / 1400.0))
+            if len(msg) > MTU:
+                comp = snappy.compress(msg)
+                total = int(math.ceil(len(comp) / float(MTU)))
                 nonce = random.randint(0, 2**32 - 1)
-                # rospy.loginfo("Sending %s bytes in %s messages nonce = %i" % (
-                #         len(msg), total, nonce))
+                # rospy.loginfo("Sending %s bytes in %s messages nonce = %i ratio = %.2f" % (
+                #         len(comp), total, nonce, len(msg) / len(comp)))
                 header = struct.pack('>II', nonce, total)
-                chunks = [header + struct.pack('>I', ind) + ''.join(chunk)
-                          for ind, chunk in enumerate(chunker(msg, 1400))]
+                chunks = [header + struct.pack('>I', ind) + bytearray(chunk)
+                          for ind, chunk in enumerate(chunker(comp, MTU))]
                 self.sent_cache[nonce] = ChunkedMessage(nonce, total, chunks)
                 for chunk in chunks:
                     payload = self.NO_ACK_CHUNK + chunk
@@ -478,8 +484,8 @@ class UDPServer(asyncore.dispatcher):
                                              self.purge_duration)
             for nonce, cmesg in retransmits:
                 inds = list(cmesg.remaining)
-                rospy.loginfo("Requesting %i packets from %s (nonce=%i)",
-                              len(inds), clt.addr, nonce)
+                # rospy.loginfo("Requesting %i packets from %s (nonce=%i)",
+                #               len(inds), clt.addr, nonce)
                 # Make sure each payload is below MTU
                 for chunk in chunker(inds, 695):
                     payload = (self.RETRANSMIT + struct.pack('>II', nonce, len(chunk)) +
@@ -533,7 +539,7 @@ class UDPServer(asyncore.dispatcher):
         if timeout is None:
             self._deq.append((payload, addrs))
         else:
-            if len(payload) > 1400:
+            if len(payload) > MTU:
                 rospy.logwarn("Message is too big, ignoring")
                 return
             
