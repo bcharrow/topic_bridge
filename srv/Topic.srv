@@ -1,4 +1,5 @@
-uint8 SUBSCRIBE = 0
+uint8 SUBSCRIBE = 0  # Remote forwards messages to local
+uint8 BRIDGE = 1     # Remote and local forward messages to each other
 
 uint8 action
 string ip     # IPv4 address

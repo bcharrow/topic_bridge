@@ -72,6 +72,7 @@ class Bridge(object):
     LOCAL_SUB = 2
     SERV_REQ = 3
     SERV_ACK = 4
+    LOCAL_BRIDGE = 5
     
     def __init__(self):
         # TODO: Have way of purging dead addresses
@@ -116,7 +117,7 @@ class Bridge(object):
         payload = data[4:]
         topic, mtype, msg = parse_header(payload)
         
-        if cmd not in [Bridge.LOCAL_PUB, Bridge.LOCAL_SUB]:
+        if cmd not in [Bridge.LOCAL_PUB, Bridge.LOCAL_SUB, Bridge.LOCAL_BRIDGE]:
             rospy.logwarn('%s requested tasks on an external machine' % (addr, ))
             return
         self._queue.put((cmd, addr, topic, mtype, msg))
@@ -125,8 +126,10 @@ class Bridge(object):
         self._queue.put((self.SERV_REQ, req, resp, event))
     
     def _local_topic_cb(self, msg):
-        # Callback for messages from local master that we're subscribed to
-        self._queue.put((self.EXTERN_PUB, msg))
+        # Callback for messages from local master that we're subscribed to;
+        # only do this if we're not the ones publishing
+        if msg._connection_header['callerid'] != rospy.get_name():
+            self._queue.put((self.EXTERN_PUB, msg))
 
     def _serv_ack_cb(self, success, addr, msg):
         # Callback for service messages, which are acknowledged
@@ -180,6 +183,9 @@ class Bridge(object):
         resp['resp'] = topic_bridge.srv.TopicResponse(success = success)
         # Create local publisher if remote end ACK'ed our request
         if success:
+            if req.action == topic_bridge.srv.TopicRequest.BRIDGE:
+                self._get_pub(req.topic, req.mtype, addr)
+                self._add_sub(req.topic, req.mtype, addr)
             if req.action == topic_bridge.srv.TopicRequest.SUBSCRIBE:
                 self._get_pub(req.topic, req.mtype, addr)
 
@@ -198,7 +204,8 @@ class Bridge(object):
         if not good:
             rospy.logwarn('Bad service request %s' % req)
 
-        act = {topic_bridge.srv.TopicRequest.SUBSCRIBE: Bridge.LOCAL_SUB}
+        act = {topic_bridge.srv.TopicRequest.SUBSCRIBE: Bridge.LOCAL_SUB,
+               topic_bridge.srv.TopicRequest.BRIDGE: Bridge.LOCAL_BRIDGE}
         if req.action in act:
             addr = (ip, req.port)
             q = self._service_resps.setdefault(addr, collections.deque())
@@ -241,6 +248,11 @@ class Bridge(object):
         # send messages to us, we died, and then came back.
         self._get_pub(topic, mtype, addr).publish_serialized(smesg)
 
+    def _local_bridge(self, addr, topic, mtype, msg):
+        # Create a bridge locally
+        self._add_sub(topic, mtype, addr)
+        self._get_pub(topic, mtype, addr)
+    
     #=============================== Main loop ===============================#
     def run(self, timeout = 0.5):
         # Main event loop.  Get items off of queue and process them.
@@ -256,6 +268,7 @@ class Bridge(object):
             dispatch = {Bridge.EXTERN_PUB: self._extern_pub,
                         Bridge.LOCAL_PUB: self._local_pub,
                         Bridge.LOCAL_SUB: self._local_sub,
+                        Bridge.LOCAL_BRIDGE: self._local_bridge,                        
                         Bridge.SERV_REQ: self._service_request,
                         Bridge.SERV_ACK: self._serv_ack}
 
