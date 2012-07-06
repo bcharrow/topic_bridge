@@ -72,6 +72,7 @@ class Bridge(object):
     LOCAL_PUB = 2
     LOCAL_SUB = 3
     SERV_REQ = 4
+    SERV_ACK = 5
     
     def __init__(self):
         # TODO: Have way of purging dead addresses
@@ -85,7 +86,9 @@ class Bridge(object):
         self._resolver = ROSResolver()
         # Map names of dynamiaclly created classes to the classes themselves
         self._classes = {}
-        
+        # Map (IP, port) to (event, response); used for service responses.
+        self._service_resps = {}
+
     def set_send(self, f):
         # Set method used to send packets to external clients
         self._send = f
@@ -126,6 +129,10 @@ class Bridge(object):
         # Callback for messages from local master that we're subscribed to
         self._queue.put((self.EXTERN_PUB, msg))
 
+    def _serv_ack_cb(self, success, addr, msg):
+        # Callback for service messages, which are acknowledged
+        self._queue.put((self.SERV_ACK, success, addr, msg))
+        
     #=========================== Helper functions ============================#
     def subscribe_external(self, address, topic, mtype):
         # Subscribe to a topic on another and machine and publish it locally
@@ -134,6 +141,25 @@ class Bridge(object):
     #============================== Processing ===============================#
     # These should only get called by main loop
 
+    def _serv_ack(self, success, addr, msg):
+        req, event, resp = self._service_resps[addr].popleft()
+        resp['resp'] = topic_bridge.srv.TopicResponse(success = success)
+        # Create local publisher if remote end ACK'ed our request
+        if success:
+            key = (req.topic, req.mtype)
+            if key in self._publishers:
+                rospy.loginfo("Local publisher for %s (%s) from %s exists" % (
+                        req.topic, req.mtype, addr))
+            else:
+                rospy.loginfo("Creating local publisher for %s (%s) from %s"
+                              % (req.topic, req.mtype, addr))
+
+                mtype_cls = self._resolver.get_msg_class(req.mtype)
+                pub = SerializedPublisher(req.topic, mtype_cls)
+                self._publishers[key] = pub
+
+        event.set()
+    
     def _service_request(self, req, resp, event):
         if req.action == topic_bridge.srv.TopicRequest.SUBSCRIBE:
             # TODO:  better error checking
@@ -143,30 +169,20 @@ class Bridge(object):
             if not good:
                 rospy.logwarn('Bad service request %s' % req)
             else:
-                resp['resp'] = topic_bridge.srv.TopicResponse()
-                self.subscribe_external((req.ip, req.port), req.topic, req.mtype)
+                addr = (socket.gethostbyname(req.ip), req.port)
+                q = self._service_resps.setdefault(addr, collections.deque())
+                q.append((req, event, resp))
+                self.subscribe_external(addr, req.topic, req.mtype)
         else:
             rospy.logwarn('Unknown service type %s' % req.action)
-        event.set()
+            
     
     def _extern_sub(self, address, topic, mtype):
         # Request that an external client subscribe to a topic and forward it
         # to us
-        key = (topic, mtype)
-        if key in self._publishers:
-            rospy.loginfo("Local publisher for %s (%s) from %s already exists" % (
-                    topic, mtype, address))
-        else:
-            rospy.loginfo("Creating local publisher for %s (%s) from %s" % (
-                    topic, mtype, address))
-
-            mtype_cls = self._resolver.get_msg_class(mtype)
-        
-            self._publishers[key] = SerializedPublisher(topic, mtype_cls)
-        
         enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
                           Bridge.LOCAL_SUB, len(topic), topic, len(mtype), mtype)
-        self._send(enc, [address], 5.0)
+        self._send(enc, [address], 5.0, self._serv_ack_cb)
 
     def _extern_pub(self, msg):
         # Publish a message on an external machine
@@ -244,7 +260,8 @@ class Bridge(object):
                         Bridge.EXTERN_SUB: self._extern_sub,
                         Bridge.LOCAL_PUB: self._local_pub,
                         Bridge.LOCAL_SUB: self._local_sub,
-                        Bridge.SERV_REQ: self._service_request}
+                        Bridge.SERV_REQ: self._service_request,
+                        Bridge.SERV_ACK: self._serv_ack}
 
             if key not in dispatch:
                 rospy.logwarn("Unknown type on Queue: %s" % type)
@@ -258,7 +275,6 @@ class Client(object):
         self.seqno = -1
         self.deq = collections.deque()
         # Sequence number of the 
-        self.seqno_processed = -1
         self.last_sent = 0
         # Map from nonce to ChunkedMessage
         self.chunked_messages = {}
@@ -301,6 +317,9 @@ class Client(object):
         self.black_list.add(nonce)
         self.black_list_expire.append((nonce, time.time()))
 
+# Messages requiring an Ack
+AckMsg = collections.namedtuple('AckMsg', ['cb', 'timeout', 'seqno', 'msg'])
+        
 class ChunkedMessage(object):
     def __init__(self, nonce, total, chunks = None):
         self.nonce = nonce
@@ -364,29 +383,25 @@ class UDPServer(asyncore.dispatcher):
         return self._clients[(ip, port)]
 
     def _read_need_ack(self, data, addr):
-        # Check if we've already processed this
-        seqno, = struct.unpack('>I', data[1:5])
         client = self._get_or_create_client(addr)
         # rospy.logdebug("Got message from %s seqno=%s" % (
         #         client.addr, seqno))
-        if client.seqno_processed == -1:
-            client.seqno_processed = seqno - 1
-        if client.seqno_processed + 1 == seqno:
-            rospy.logdebug("Processing message")
-            self._read_cb(addr, data[5:])
-            client.seqno_processed = seqno
-        # Send ACK
-        # rospy.logdebug("Sending ACK %s to %s" % (
-        #         struct.unpack('>I', data[1:5])[0], addr))
+        rospy.logdebug("Processing message")
+        self._read_cb(addr, data[5:])
+        # Send ACK with 4 bytes acknowleding that we've processed this
         self.sendto(self.ACK + data[1:5], addr)
 
     def _read_ack(self, data, addr):
         # Acknowledge that we got an ACK
         seqno, = struct.unpack('>I', data[1:5])
         client = self._get_client(addr)
-        if client.deq[0][1] == seqno:
-            # rospy.logdebug("Got ACK from %s on seqno=%i" % (
-            #         client.addr, seqno))
+
+        ackmsg = client.deq[0]
+        if ackmsg.seqno == seqno:
+            rospy.logdebug("Got ACK from %s on seqno=%i" % (
+                    client.addr, seqno))
+            if callable(ackmsg.cb):
+                ackmsg.cb(True, client.addr, ackmsg.msg)
             client.deq.popleft()
             client.last_sent = 0
         elif client.seqno < seqno:
@@ -469,12 +484,13 @@ class UDPServer(asyncore.dispatcher):
 
     def _write_reliable(self):
         # Add new reliable messages to clients
-        msg, addrs, timeout = self._fifo.popleft()
+        msg, addrs, timeout, cb = self._fifo.popleft()
         for addr in addrs:
             clt = self._get_or_create_client(addr)
             # rospy.logdebug("Enqueueing message for %s" % (clt.addr, ))
             clt.seqno += 1
-            clt.deq.append((msg, clt.seqno, timeout))
+            am = AckMsg(msg = msg, cb = cb, timeout = timeout, seqno = clt.seqno)
+            clt.deq.append(am)
 
     def _write_client(self, clt):
         retransmits = clt.get_retransmit(self.retransmit_duration,
@@ -496,18 +512,22 @@ class UDPServer(asyncore.dispatcher):
         if len(clt.deq) == 0:
             return
 
-        msg, seqno, timeout = clt.deq[0]
+        ackmsg = clt.deq[0]
         if clt.last_sent == 0:
             # Send message
-            # rospy.logdebug("Sending message to %s seqno=%i" % (
-            #         clt.addr, seqno))
-            payload = self.NEED_ACK + struct.pack('>I', seqno) + msg
+            # rospy.loginfo("Sending message to %s seqno=%i" % (
+            #         clt.addr, ackmsg.seqno))
+            payload = (self.NEED_ACK + struct.pack('>I', ackmsg.seqno) +
+                       ackmsg.msg)
             self.sendto(payload, clt.addr)
             clt.last_sent = time.time()
-        elif time.time() - clt.last_sent > timeout:
-            # No ACK for message; resend
-            # rospy.logdebug("Message to %s seqno=%i expired, resending" % (
-            #         clt.addr, seqno))
+        elif time.time() - clt.last_sent > ackmsg.timeout:
+            # No ACK for message; drop it
+            if callable(ackmsg.cb):
+                ackmsg.cb(False, clt.addr, ackmsg.msg)
+            clt.deq.popleft()
+            # rospy.loginfo("Message to %s seqno=%i expired, drop it" % (
+            #         clt.addr, clt.seqno))
             clt.last_sent = 0
 
     def handle_write(self):
@@ -535,14 +555,14 @@ class UDPServer(asyncore.dispatcher):
               any(clt.get_retransmit(self.retransmit_duration, self.purge_duration) or
                   (len(clt.deq) > 0 and
                    (clt.last_sent == 0 or
-                    now - clt.last_sent > clt.deq[0][2]))
+                    now - clt.last_sent > clt.deq[0].timeout))
                   for clt in self._clients.values()))
         return rv
 
     def set_read_cb(self, cb):
         self._read_cb = cb
 
-    def send_msg(self, payload, addrs, timeout = None):
+    def send_msg(self, payload, addrs, timeout = None, cb = None):
         # Thread safe function to send bitstream to list of (IP, port) addrs
         if timeout is None:
             self._deq.append((payload, addrs))
@@ -550,8 +570,7 @@ class UDPServer(asyncore.dispatcher):
             if len(payload) > MTU:
                 rospy.logwarn("Message is too big, ignoring")
                 return
-            
-            self._fifo.append((payload, addrs, timeout))
+            self._fifo.append((payload, addrs, timeout, cb))
 
 def chunker(iterable, chunksize):
     """
