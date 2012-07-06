@@ -68,11 +68,10 @@ class SerializedPublisher(rospy.topics.Publisher):
     
 class Bridge(object):
     EXTERN_PUB = 0
-    EXTERN_SUB = 1
-    LOCAL_PUB = 2
-    LOCAL_SUB = 3
-    SERV_REQ = 4
-    SERV_ACK = 5
+    LOCAL_PUB = 1
+    LOCAL_SUB = 2
+    SERV_REQ = 3
+    SERV_ACK = 4
     
     def __init__(self):
         # TODO: Have way of purging dead addresses
@@ -132,77 +131,23 @@ class Bridge(object):
     def _serv_ack_cb(self, success, addr, msg):
         # Callback for service messages, which are acknowledged
         self._queue.put((self.SERV_ACK, success, addr, msg))
-        
-    #=========================== Helper functions ============================#
-    def subscribe_external(self, address, topic, mtype):
-        # Subscribe to a topic on another and machine and publish it locally
-        self._queue.put((Bridge.EXTERN_SUB, address, topic, mtype))
-
+                
     #============================== Processing ===============================#
     # These should only get called by main loop
 
-    def _serv_ack(self, success, addr, msg):
-        req, event, resp = self._service_resps[addr].popleft()
-        resp['resp'] = topic_bridge.srv.TopicResponse(success = success)
-        # Create local publisher if remote end ACK'ed our request
-        if success:
-            key = (req.topic, req.mtype)
-            if key in self._publishers:
-                rospy.loginfo("Local publisher for %s (%s) from %s exists" % (
-                        req.topic, req.mtype, addr))
-            else:
-                rospy.loginfo("Creating local publisher for %s (%s) from %s"
-                              % (req.topic, req.mtype, addr))
-
-                mtype_cls = self._resolver.get_msg_class(req.mtype)
-                pub = SerializedPublisher(req.topic, mtype_cls)
-                self._publishers[key] = pub
-
-        event.set()
-    
-    def _service_request(self, req, resp, event):
-        if req.action == topic_bridge.srv.TopicRequest.SUBSCRIBE:
-            # TODO:  better error checking
-            good = (self._resolver.is_valid_mtype(req.mtype) and
-                    len(req.topic) > 0 and
-                    len(req.ip) > 0)
-            if not good:
-                rospy.logwarn('Bad service request %s' % req)
-            else:
-                addr = (socket.gethostbyname(req.ip), req.port)
-                q = self._service_resps.setdefault(addr, collections.deque())
-                q.append((req, event, resp))
-                self.subscribe_external(addr, req.topic, req.mtype)
-        else:
-            rospy.logwarn('Unknown service type %s' % req.action)
-            
-    
-    def _extern_sub(self, address, topic, mtype):
-        # Request that an external client subscribe to a topic and forward it
-        # to us
-        enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
-                          Bridge.LOCAL_SUB, len(topic), topic, len(mtype), mtype)
-        self._send(enc, [address], 5.0, self._serv_ack_cb)
-
-    def _extern_pub(self, msg):
-        # Publish a message on an external machine
-        mtype = msg._connection_header['type']
-        topic = msg._connection_header['topic']
+    def _get_pub(self, topic, mtype, addr):
         key = (topic, mtype)
-        
-        # msg.serialize(buff)
-        # ser = buff.getvalue()
-        ser = msg.serialized
-        dests = self._subscriptions[key][1]
+        if key not in self._publishers:
+            rospy.loginfo("Creating local publisher for %s (%s)  %s" % (
+                    topic, mtype, addr))
+            
+            mtype_cls = self._resolver.get_msg_class(mtype)
+            pub = SerializedPublisher(topic, mtype_cls)
+            self._publishers[key] = pub
+        return self._publishers[key]
 
-        msg = struct.pack('>II%ssI%ss%ss' % (len(topic), len(mtype), len(ser)),
-                          Bridge.LOCAL_PUB, len(topic), topic, len(mtype), mtype, ser)
-        # rospy.logdebug("BRIDGE:: Received message on %s (%s).  Sending to %s",
-        #                topic, mtype, dests)
-        self._send(msg, dests)
-        
-    def _local_sub(self, addr, topic, mtype, msg):
-        # Subscribe to messages locally and send to external master
+    def _add_sub(self, topic, mtype, addr):
+        # Ensure that addr receives mtype messages on topic
         key = (topic, mtype)
         if key not in self._subscriptions:
             rospy.loginfo("Subscribing %s to %s (%s)" % (addr, topic, mtype))
@@ -229,21 +174,73 @@ class Bridge(object):
             else:
                 rospy.loginfo("%s is already subscribed to %s (%s)" % (
                         addr, topic, mtype))
+    
+    def _serv_ack(self, success, addr, msg):
+        req, event, resp = self._service_resps[addr].popleft()
+        resp['resp'] = topic_bridge.srv.TopicResponse(success = success)
+        # Create local publisher if remote end ACK'ed our request
+        if success:
+            if req.action == topic_bridge.srv.TopicRequest.SUBSCRIBE:
+                self._get_pub(req.topic, req.mtype, addr)
+
+        event.set()
+    
+    def _service_request(self, req, resp, event):
+        good = (self._resolver.is_valid_mtype(req.mtype) and
+                len(req.topic) > 0)
+        try:
+            ip = socket.gethostbyname(req.ip)
+        except socket.gaierror:
+            good = False
+
+        topic, mtype = req.topic, req.mtype
+            
+        if not good:
+            rospy.logwarn('Bad service request %s' % req)
+
+        act = {topic_bridge.srv.TopicRequest.SUBSCRIBE: Bridge.LOCAL_SUB}
+        if req.action in act:
+            addr = (ip, req.port)
+            q = self._service_resps.setdefault(addr, collections.deque())
+            q.append((req, event, resp))
+            enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
+                              act[req.action], len(topic), topic, len(mtype),
+                              mtype)
+            self._send(enc, [addr], 5.0, self._serv_ack_cb)
+        else:
+            rospy.logwarn('Unknown service type %s' % req.action)
+    
+    def _extern_pub(self, msg):
+        # Publish a message on an external machine
+        mtype = msg._connection_header['type']
+        topic = msg._connection_header['topic']
+        key = (topic, mtype)
+        
+        # msg.serialize(buff)
+        # ser = buff.getvalue()
+        ser = msg.serialized
+        dests = self._subscriptions[key][1]
+
+        msg = struct.pack('>II%ssI%ss%ss' % (len(topic), len(mtype), len(ser)),
+                          Bridge.LOCAL_PUB, len(topic), topic, len(mtype), mtype, ser)
+        # rospy.logdebug("BRIDGE:: Received message on %s (%s).  Sending to %s",
+        #                topic, mtype, dests)
+        self._send(msg, dests)
+        
+    def _local_sub(self, addr, topic, mtype, msg):
+        # Subscribe to messages locally and send to external master
+        self._add_sub(topic, mtype, addr)
         
     def _local_pub(self, addr, topic, mtype, msg):
         # Publish a message locally from an external master
         smesg = SerializedMessage(msg)
-        key = (topic, mtype)
         # rospy.logdebug("Publishing on %s (%s)" % (topic, mtype))
         
-        # There may not be a publisher for the message if we asked an external
-        # master to send messages to us, died, and then came back.
-        if key not in self._publishers:
-            mtype_cls = self._resolver.get_msg_class(mtype)
-            self._publishers[key] = SerializedPublisher(topic, mtype_cls)
+        # If the publisher for this topic and mtype doesn't exist, _get_pub()
+        # will create it.  This can happen if if we asked an external master to
+        # send messages to us, we died, and then came back.
+        self._get_pub(topic, mtype, addr).publish_serialized(smesg)
 
-        self._publishers[key].publish_serialized(smesg)
-        
     #=============================== Main loop ===============================#
     def run(self, timeout = 0.5):
         # Main event loop.  Get items off of queue and process them.
@@ -257,7 +254,6 @@ class Bridge(object):
             args = items[1:]
 
             dispatch = {Bridge.EXTERN_PUB: self._extern_pub,
-                        Bridge.EXTERN_SUB: self._extern_sub,
                         Bridge.LOCAL_PUB: self._local_pub,
                         Bridge.LOCAL_SUB: self._local_sub,
                         Bridge.SERV_REQ: self._service_request,
