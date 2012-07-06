@@ -445,74 +445,82 @@ class UDPServer(asyncore.dispatcher):
         else:
             rospy.logwarn('Message with invalid header packet from %s' % (addr, ))
 
+    def _write_unreliable(self):
+        msg, addrs = self._deq.popleft()
+        if len(msg) > MTU:
+            comp = snappy.compress(msg)
+            total = int(math.ceil(len(comp) / float(MTU)))
+            nonce = random.randint(0, 2**32 - 1)
+            # rospy.loginfo("Sending %s bytes in %s messages nonce = %i ratio = %.2f" % (
+            #         len(comp), total, nonce, len(msg) / len(comp)))
+            header = struct.pack('>II', nonce, total)
+            chunks = [header + struct.pack('>I', ind) + bytearray(chunk)
+                      for ind, chunk in enumerate(chunker(comp, MTU))]
+            self.sent_cache[nonce] = ChunkedMessage(nonce, total, chunks)
+            for chunk in chunks:
+                payload = self.NO_ACK_CHUNK + chunk
+                for addr in addrs:
+                    self.sendto(payload, addr)
+        else:
+            # rospy.logdebug("UDP Server:: Sending data to %s" % addrs)
+            msg = self.NO_ACK + msg
+            for addr in addrs:
+                self.sendto(msg, addr)
+
+    def _write_reliable(self):
+        # Add new reliable messages to clients
+        msg, addrs, timeout = self._fifo.popleft()
+        for addr in addrs:
+            clt = self._get_or_create_client(addr)
+            # rospy.logdebug("Enqueueing message for %s" % (clt.addr, ))
+            clt.seqno += 1
+            clt.deq.append((msg, clt.seqno, timeout))
+
+    def _write_client(self, clt):
+        retransmits = clt.get_retransmit(self.retransmit_duration,
+                                         self.purge_duration)
+        for nonce, cmesg in retransmits:
+            inds = list(cmesg.remaining)
+            # rospy.loginfo("Requesting %i packets from %s (nonce=%i)",
+            #               len(inds), clt.addr, nonce)
+            # Make sure each payload is below MTU
+            for chunk in chunker(inds, MTU / 2 - 9):
+                header = self.RETRANSMIT + struct.pack('>II', nonce, len(chunk))
+                payload = (header + struct.pack('>%sH' % len(chunk), *chunk))
+                self.sendto(payload, clt.addr)
+            # To ensure that we don't re-request packet several times, reset
+            # add time
+            cmesg.last_added = time.time()
+
+        # Nothing to do
+        if len(clt.deq) == 0:
+            return
+
+        msg, seqno, timeout = clt.deq[0]
+        if clt.last_sent == 0:
+            # Send message
+            # rospy.logdebug("Sending message to %s seqno=%i" % (
+            #         clt.addr, seqno))
+            payload = self.NEED_ACK + struct.pack('>I', seqno) + msg
+            self.sendto(payload, clt.addr)
+            clt.last_sent = time.time()
+        elif time.time() - clt.last_sent > timeout:
+            # No ACK for message; resend
+            # rospy.logdebug("Message to %s seqno=%i expired, resending" % (
+            #         clt.addr, seqno))
+            clt.last_sent = 0
+
     def handle_write(self):
         # Handle regular UDP
         if len(self._deq) > 0:
-            msg, addrs = self._deq.popleft()
-            if len(msg) > MTU:
-                comp = snappy.compress(msg)
-                total = int(math.ceil(len(comp) / float(MTU)))
-                nonce = random.randint(0, 2**32 - 1)
-                # rospy.loginfo("Sending %s bytes in %s messages nonce = %i ratio = %.2f" % (
-                #         len(comp), total, nonce, len(msg) / len(comp)))
-                header = struct.pack('>II', nonce, total)
-                chunks = [header + struct.pack('>I', ind) + bytearray(chunk)
-                          for ind, chunk in enumerate(chunker(comp, MTU))]
-                self.sent_cache[nonce] = ChunkedMessage(nonce, total, chunks)
-                for chunk in chunks:
-                    payload = self.NO_ACK_CHUNK + chunk
-                    for addr in addrs:
-                        self.sendto(payload, addr)
-            else:
-                # rospy.logdebug("UDP Server:: Sending data to %s" % addrs)
-                msg = self.NO_ACK + msg
-                for addr in addrs:
-                    self.sendto(msg, addr)
-                
-        # Add new reliable messages to clients
+            self._write_unreliable()
+            
         if len(self._fifo) > 0:
-            msg, addrs, timeout = self._fifo.popleft()
-            for addr in addrs:
-                clt = self._get_or_create_client(addr)
-                # rospy.logdebug("Enqueueing message for %s" % (clt.addr, ))
-                clt.seqno += 1
-                clt.deq.append((msg, clt.seqno, timeout))
+            self._write_reliable()
                 
         # Handle client needs
         for clt in self._clients.values():
-            retransmits = clt.get_retransmit(self.retransmit_duration,
-                                             self.purge_duration)
-            for nonce, cmesg in retransmits:
-                inds = list(cmesg.remaining)
-                # rospy.loginfo("Requesting %i packets from %s (nonce=%i)",
-                #               len(inds), clt.addr, nonce)
-                # Make sure each payload is below MTU
-                for chunk in chunker(inds, 695):
-                    payload = (self.RETRANSMIT + struct.pack('>II', nonce, len(chunk)) +
-                               struct.pack('>%sH' % len(chunk), *chunk))
-                    self.sendto(payload, clt.addr)
-                # To ensure that we don't re-request packet several times,
-                # reset add time
-                cmesg.last_added = time.time()
-                
-
-            # Nothing to do
-            if len(clt.deq) == 0:
-                continue
-            
-            msg, seqno, timeout = clt.deq[0]
-            if clt.last_sent == 0:
-                # Send message
-                # rospy.logdebug("Sending message to %s seqno=%i" % (
-                #         clt.addr, seqno))
-                payload = self.NEED_ACK + struct.pack('>I', seqno) + msg
-                self.sendto(payload, clt.addr)
-                clt.last_sent = time.time()
-            elif time.time() - clt.last_sent > timeout:
-                # No ACK for message; resend
-                # rospy.logdebug("Message to %s seqno=%i expired, resending" % (
-                #         clt.addr, seqno))
-                clt.last_sent = 0
+            self._write_client(clt)
 
         # Check if any chunked messages that we've sent need to be purged
         for nonce, chunk in self.sent_cache.items():
