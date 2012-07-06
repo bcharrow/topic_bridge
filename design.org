@@ -15,14 +15,29 @@
 
 * Overview
 
-topic_forward enables robots on separate machines to communicate when they do
+topic\_bridge enables robots on separate machines to communicate when they do
 not use the same ROS master.
 
-Each ROS master should have a single topic_bridge node. The node listens to
+Each ROS master should have a single topic\_bridge node. The node listens to
 specified topics via ROS' communication infrastructure, and sends messages it
-receives to other topic_bridge nodes on other ROS masters via UDP.  Upon
-receiving a message from a foreign topic_bridge, the local topic_bridge will
+receives to other topic\_bridge nodes on other ROS masters via UDP.  Upon
+receiving a message from a foreign topic\_bridge, the local topic\_bridge will
 broadcast the message locally via ROS' communication infrastructure.
+
+Bridges can be one way or two way.  A one way bridge between two computers
+would mean one machine sends its local messages to the other computer, but the
+reverse does not happen.  Bridges are configured on a per-topic basis.
+
+* Usage
+ Assuming you have a topic\_bridge running on local master.
+
+ Get messages from 192.168.130.27:8080/test forwarded to local machine.
+ : rosservice call /topic_bridge/topic "{ip: '192.168.130.27', port: 8080, 
+ :   mtype: 'std_msgs/String', topic: '/test'}"
+
+ Send / get messages between localhost and 192.168.130.27:8080 (2-way bridge)
+ : rosservice call /topic_bridge/topic "{ip: '192.168.130.27', port: 808,0hi 
+ :   mtype: 'std_msgs/String', topic: '/test', action: 1}"
 
 * Design notes
 
@@ -41,14 +56,16 @@ broadcast the message locally via ROS' communication infrastructure.
 I've measured the following on a mesh 802.11S network using the Scarabs.
 
 - Ping time between two bots is ~2ms.
-- When transferring a file frome one scarab to another via scp, the max data
+- When transferring a file from one scarab to another via scp, the max data
   rate is 2.8 MB/s and about 30% of the CPU is used.
 - If you send zeros via UDP from one scarab to another via netcat, the max data
-  rate is 3.3 MB/s, but it occasionally drops to 2.2 MB/s.  This is due to
-  small default send / receive UDP buffer sizes.  At these rates, the sender
-  has ~4% CPU utilization, while the receiver has ~2% utilization.
+  rate is 3.3 MB/s, but it occasionally drops to 2.2 MB/s.  This variance is
+  due to small default send / receive UDP buffer sizes.  At these rates, the
+  sender has ~4% CPU utilization, while the receiver has ~2% utilization.
 
-  Sender command: cat /dev/zero | netcat -u 192.168.130.28 8080
-  Receiver command: netcat -l -u -p 8080 | pv > /dev/null
-
-  Check dropped UDP packets: netstat -su
+  Sender command
+  : cat /dev/zero | netcat -u 192.168.130.28 8080
+  Receiver command
+  : netcat -l -u -p 8080 | pv > /dev/null
+  Check dropped UDP packets
+  : netstat -su
