@@ -81,7 +81,7 @@ class Bridge(object):
         # Thread-safe callback functions to send messages with
         self._send = None
         # Queue to process commands to subscribe / publish a message
-        self._queue = Queue.Queue()
+        self._deq = collections.deque()
         # Used to resolve ROS names; not thread safe
         self._resolver = ROSResolver()
         # Map names of dynamiaclly created classes to the classes themselves
@@ -120,20 +120,20 @@ class Bridge(object):
         if cmd not in [Bridge.LOCAL_PUB, Bridge.LOCAL_SUB, Bridge.LOCAL_BRIDGE]:
             rospy.logwarn('%s requested tasks on an external machine' % (addr, ))
             return
-        self._queue.put((cmd, addr, topic, mtype, msg))
+        self._deq.append((cmd, addr, topic, mtype, msg))
 
     def service_request(self, req, resp, event):
-        self._queue.put((self.SERV_REQ, req, resp, event))
+        self._deq.append((self.SERV_REQ, req, resp, event))
     
     def _local_topic_cb(self, msg):
         # Callback for messages from local master that we're subscribed to;
         # only do this if we're not the ones publishing
         if msg._connection_header['callerid'] != rospy.get_name():
-            self._queue.put((self.EXTERN_PUB, msg))
+            self._deq.append((self.EXTERN_PUB, msg))
 
     def _serv_ack_cb(self, success, addr, msg):
         # Callback for service messages, which are acknowledged
-        self._queue.put((self.SERV_ACK, success, addr, msg))
+        self._deq.append((self.SERV_ACK, success, addr, msg))
                 
     #============================== Processing ===============================#
     # These should only get called by main loop
@@ -257,11 +257,10 @@ class Bridge(object):
     def run(self, timeout = 0.5):
         # Main event loop.  Get items off of queue and process them.
         while not rospy.is_shutdown():
-            try:
-                items = self._queue.get(timeout = timeout)
-            except Queue.Empty:
+            if len(self._deq) == 0:
+                time.sleep(0.01)
                 continue
-
+            items = self._deq.popleft()
             key = items[0]
             args = items[1:]
 
