@@ -74,7 +74,7 @@ class Bridge(object):
     SERV_ACK = 4
     LOCAL_BRIDGE = 5
     
-    def __init__(self):
+    def __init__(self, name):
         # TODO: Have way of purging dead addresses
         self._subscriptions = {}
         self._publishers = {}
@@ -88,6 +88,8 @@ class Bridge(object):
         self._classes = {}
         # Map (IP, port) to (event, response); used for service responses.
         self._service_resps = {}
+        # Name to filter
+        self._name = name
 
     def set_send(self, f):
         # Set method used to send packets to external clients
@@ -128,7 +130,7 @@ class Bridge(object):
     def _local_topic_cb(self, msg):
         # Callback for messages from local master that we're subscribed to;
         # only do this if we're not the ones publishing
-        if msg._connection_header['callerid'] != rospy.get_name():
+        if msg._connection_header['callerid'] != self._name:
             self._deq.append((self.EXTERN_PUB, msg))
 
     def _serv_ack_cb(self, success, addr, msg):
@@ -602,8 +604,10 @@ def handle_service(bridge, req):
     evt.wait()
     return resp['resp']
 
-def main(port, nameg):
-    bridge = Bridge()
+def main(port, name):
+    rospy.init_node(name)
+    
+    bridge = Bridge(rospy.get_name())
     server = UDPServer(port)
 
     server.set_read_cb(bridge.recv_msg_cb)
@@ -614,7 +618,7 @@ def main(port, nameg):
     server_thread.daemon = True
     server_thread.start()
     
-    rospy.init_node(name)
+
     srv = rospy.Service('~topic', topic_bridge.srv.Topic,
                         lambda req: handle_service(bridge, req))
 
