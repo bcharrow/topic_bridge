@@ -181,17 +181,21 @@ class Bridge(object):
                         addr, topic, mtype))
     
     def _serv_ack(self, success, addr, msg):
-        req, event, resp = self._service_resps[addr].popleft()
-        resp['resp'] = topic_bridge.srv.TopicResponse(success = success)
         # Create local publisher if remote end ACK'ed our request
+        req = self._service_resps[addr].popleft()
         if success:
             if req.action == topic_bridge.srv.TopicRequest.BRIDGE:
                 self._get_pub(req.topic, req.mtype, addr)
                 self._add_sub(req.topic, req.mtype, addr)
             if req.action == topic_bridge.srv.TopicRequest.SUBSCRIBE:
                 self._get_pub(req.topic, req.mtype, addr)
-
-        event.set()
+        else:
+            # Retransmit message; append request to end of messages that are
+            # outgoing to addr.  This maintains the invariant that callbacks to
+            # _serv_ack pertain to the first item in the list at _service_resps
+            rospy.logwarn("Couldn't send %s\nretrying" % req)
+            self._service_resps[addr].append(req)
+            self._send(msg, [addr], 5.0, self._serv_ack_cb)
     
     def _service_request(self, req, resp, event):
         good = (self._resolver.is_valid_mtype(req.mtype) and
@@ -201,23 +205,27 @@ class Bridge(object):
         except socket.gaierror:
             good = False
 
-        topic, mtype = req.topic, req.mtype
-            
-        if not good:
-            rospy.logwarn('Bad service request %s' % req)
-
         act = {topic_bridge.srv.TopicRequest.SUBSCRIBE: Bridge.LOCAL_SUB,
                topic_bridge.srv.TopicRequest.BRIDGE: Bridge.LOCAL_BRIDGE}
-        if req.action in act:
-            addr = (ip, req.port)
-            q = self._service_resps.setdefault(addr, collections.deque())
-            q.append((req, event, resp))
-            enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
-                              act[req.action], len(topic), topic, len(mtype),
-                              mtype)
-            self._send(enc, [addr], 5.0, self._serv_ack_cb)
-        else:
-            rospy.logwarn('Unknown service type %s' % req.action)
+        good = good and req.action in act
+            
+        if not good:
+            rospy.logwarn('Bad service request:\n%s' % req)
+            resp['resp'] = topic_bridge.srv.TopicResponse(success = False)
+            event.set()
+            return
+        
+        topic, mtype = req.topic, req.mtype
+        addr = (ip, req.port)
+        q = self._service_resps.setdefault(addr, collections.deque())
+        q.append(req)
+        enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
+                          act[req.action], len(topic), topic, len(mtype),
+                          mtype)
+        self._send(enc, [addr], 5.0, self._serv_ack_cb)
+
+        resp['resp'] = topic_bridge.srv.TopicResponse(success = True)
+        event.set()
     
     def _extern_pub(self, msg):
         # Publish a message on an external machine
