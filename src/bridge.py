@@ -12,6 +12,8 @@ import random
 import itertools
 import time
 
+import yaml
+
 import snappy
 
 import roslib; roslib.load_manifest('topic_bridge')
@@ -621,6 +623,25 @@ def main(port, name):
     server.set_read_cb(bridge.recv_msg_cb)
 
     bridge.set_send(server.send_msg)
+
+    # Load configuration file if present
+    conf = rospy.get_param('~conf_file', None)
+    if conf:
+        rospy.loginfo("Loading config file %s" % conf)
+        convert = {'bridge': 1, 'subscribe': 0}
+        with open(conf) as f:
+            doc = yaml.load(f)
+        for addr, fields in doc.items():
+            ip, port = addr.split(':')
+            port = int(port)
+            for topic, mtype, cmd in fields:
+                cmd = convert[cmd.lower()]
+                req = topic_bridge.srv.TopicRequest(action = cmd,
+                                                    ip = ip, port = port,
+                                                    mtype = mtype, topic = topic)
+                bridge.service_request(req, {}, threading.Event())
+    else:
+        rospy.loginfo("Not loading a config file")
     
     server_thread = threading.Thread(target = lambda: asyncore.loop(timeout = 0.001))
     server_thread.daemon = True
