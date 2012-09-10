@@ -129,9 +129,13 @@ class Bridge(object):
     def service_request(self, req, resp, event):
         self._deq.append((self.SERV_REQ, req, resp, event))
     
-    def _local_topic_cb(self, msg):
+    def _local_topic_cb(self, msg, topic):
         # Callback for messages from local master that we're subscribed to;
         # only do this if we're not the ones publishing
+        if 'topic' not in msg._connection_header:
+            msg._connection_header['topic'] = topic
+        else:
+            assert msg._connection_header['topic'] == topic
         if msg._connection_header['callerid'] != self._name:
             self._deq.append((self.EXTERN_PUB, msg))
 
@@ -171,7 +175,7 @@ class Bridge(object):
             cls = self._classes[clsname]
                 
             self._subscriptions[key] = (
-                rospy.Subscriber(topic, cls, self._local_topic_cb), [addr])
+                rospy.Subscriber(topic, cls, lambda x: self._local_topic_cb(x, topic)), [addr])
         else:
             sub, addrs = self._subscriptions[key]
             # TODO: verify that mtype matches
