@@ -22,6 +22,26 @@ import topic_bridge.srv
 
 MTU = 1400
 
+def get_ip():
+    """Determines the IP address of the machine that calls this function.
+
+       If the device is not connected to the net, it returns the string
+       'localhost'
+
+       It turns out that it's very difficult to find a machine's IP address in
+       a way that will work on multiple platforms.  This method works by
+       sending a datagram packet to scarab-gateway and then looking at the
+       address of the socket that gets created."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.1)
+    try:
+        s.connect(('192.168.130.1', 1))
+        return s.getsockname()[0]
+    except socket.gaierror, gai:
+        sys.stderr.write("No connection to gateway, defaulting to 'localhost'\n")
+        return 'localhost'
+
+    
 class ROSResolver(object):
     def __init__(self):
         self._msgs = {}
@@ -632,11 +652,16 @@ def main(port, name):
     conf = rospy.get_param('~conf_file', None)
     if conf:
         rospy.loginfo("Loading config file %s" % conf)
+        my_ip = get_ip()
+        rospy.loginfo("My IP address is %s", my_ip)
         convert = {'bridge': 1, 'subscribe': 0}
         with open(conf) as f:
             doc = yaml.load(f)
         for addr, fields in doc.items():
             ip, port = addr.split(':')
+            if my_ip == ip:
+                rospy.loginfo("Skipping myself in config file")
+                continue
             port = int(port)
             for topic, mtype, cmd in fields:
                 cmd = convert[cmd.lower()]
