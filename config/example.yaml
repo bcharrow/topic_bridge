@@ -1,2 +1,14 @@
-'localhost:8081':
-  - ['/test', 'std_msgs/String', 'bridge']
+# When you launch this, read all machine names and then follow the options that
+# mathc your local machine
+
+'seal':
+  # Anything a foreign master publishes locally on /10000/pubsub will now
+  # appear locally on topic /10000/pubsub
+  subscribe: ['/10000/pubsub']
+  # Anything we publish locally on /10000/pubsub will now appear on all foreign
+  # masters on topic /10000/pubsub
+  publish: ['/10000/pubsub']
+
+# Defaults port is 10000, but it can be specified
+'seal:20000':
+  publish: ['/20000/pub1', '/20000/pub2']

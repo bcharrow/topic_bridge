@@ -1,47 +1,70 @@
 #!/usr/bin/env python
-
-import asyncore
 import socket
 import threading
+import logging
+import sys
 import struct
+import fcntl
+import functools
 import collections
-import cStringIO as StringIO
-import Queue
-import math
-import random
-import itertools
-import time
+
+import zmq
+import zmq.eventloop.ioloop
+import zmq.eventloop.zmqstream
 
 import yaml
 
-import snappy
-
-import roslib; roslib.load_manifest('topic_bridge')
 import rospy
-import topic_bridge.srv
+import roslib; roslib.load_manifest('topic_bridge')
+import rosgraph.names
 
-MTU = 1400
-
-def get_ip():
-    """Determines the IP address of the machine that calls this function.
-
-       If the device is not connected to the net, it returns the string
-       'localhost'
-
-       It turns out that it's very difficult to find a machine's IP address in
-       a way that will work on multiple platforms.  This method works by
-       sending a datagram packet to scarab-gateway and then looking at the
-       address of the socket that gets created."""
+def get_ip_address(ifname):
+    SIOCGIFADDR = 0xc0206921 if sys.platform == 'darwin' else 0x8915
+    """Get the IPv4 address of an interface"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(0.1)
-    try:
-        s.connect(('192.168.130.1', 1))
-        return s.getsockname()[0]
-    except socket.gaierror, gai:
-        sys.stderr.write("No connection to gateway, defaulting to 'localhost'\n")
-        return 'localhost'
+    packed_if = struct.pack('256s', ifname[:15])
+    data = fcntl.ioctl(s.fileno(), SIOCGIFADDR, packed_if)
+    return socket.inet_ntoa(data[20:24])
 
-    
+def get_ip(ifaces = None):
+    """Get the IPv4 address and interface from a list of interfaces
+
+    A tuple of (IP, interface) is returned; interfaces are searched
+    in order.  If no interfaces are active, (None, None) is returned."""
+    if ifaces is None:
+        ifaces = ["mesh", "wlan0", "eth1", "eth0", "en1", "lo"]
+    for iface in ifaces:
+        try:
+            ip = get_ip_address(iface)
+            return ip, iface
+        except IOError, e:
+            pass
+    return None, None
+
+def is_ip(name):
+    """Return true if name is a valid IPv4 or IPv6 address"""
+    try:
+        socket.inet_pton(socket.AF_INET, name)
+        return True
+    except socket.error, e:
+        pass
+
+    try:
+        socket.inet_pton(socket.AF_INET6, name)
+        return True
+    except socket.error, e:
+        pass
+    return False
+
+def is_valid_ros_topic(topic):
+    return (rosgraph.names.is_legal_name(topic) and
+            rosgraph.names.is_global(topic))
+
+def validate_ros_topic(topic):
+    if not is_valid_ros_topic(topic):
+        raise ValueError("%s is not a valid global ROS topic" % topic)
+
+# Consider using roslib.message.get_message_class(topic_type) instead
 class ROSResolver(object):
     def __init__(self):
         self._msgs = {}
@@ -55,635 +78,369 @@ class ROSResolver(object):
 
         return getattr(self._msgs[pkg], cls)
 
-    def is_valid_mtype(self, mtype):
-        return len(mtype) > 0 and len(mtype.split('/')) == 2
-
-class SerializedMessage(object):
-    # Wrapper for serialized ROS message which acts like deserialized message
-    def __init__(self, buff):
-        self._buff = buff
-
-    def serialize(self, buff):
-        buff.write(self._buff)
-
-def deserialize_noop(self, buf):
-    # Method to override default deserialize function for message objects
-    self.serialized = buf
-    return self
-        
-class SerializedPublisher(rospy.topics.Publisher):
-    def publish_serialized(self, msg):
-        if self.impl is None:
-            raise rospy.exceptions.ROSException("publish() to an unregistered() handle")
-        if not rospy.core.is_initialized():
-            raise rospy.exceptions.ROSException("ROS node has not been initialized yet. Please call init_node() first")
-
-        try:
-            self.impl.acquire()
-            self.impl.publish(msg)
-        except roslib.message.SerializationError as e:
-            # can't go to rospy.logerr(), b/c this could potentially recurse
-            rospy.topics._logger.error(traceback.format_exc(e))
-            raise rospy.exceptions.ROSSerializationException(str(e))
-        finally:
-            self.impl.release()
-    
-class Bridge(object):
-    EXTERN_PUB = 0
-    LOCAL_PUB = 1
-    LOCAL_SUB = 2
-    SERV_REQ = 3
-    SERV_ACK = 4
-    LOCAL_BRIDGE = 5
-    
+class LocalROS(object):
     def __init__(self, name):
-        # TODO: Have way of purging dead addresses
-        self._subscriptions = {}
+        self._name = name
+        self._lock = threading.Lock()
+        self._subscribers = {}
         self._publishers = {}
-        # Thread-safe callback functions to send messages with
-        self._send = None
-        # Queue to process commands to subscribe / publish a message
-        self._deq = collections.deque()
         # Used to resolve ROS names; not thread safe
         self._resolver = ROSResolver()
         # Map names of dynamiaclly created classes to the classes themselves
         self._classes = {}
-        # Map (IP, port) to (event, response); used for service responses.
-        self._service_resps = {}
-        # Name to filter
-        self._name = name
 
-    def set_send(self, f):
-        # Set method used to send packets to external clients
-        self._send = f
+        self._local_recv_cb = lambda topic, msg: None
 
-    #=============================== Callbacks ===============================#
-    # All callbacks are thread-safe
+        self._log = logging.getLogger('local')
 
-    def recv_msg_cb(self, addr, data):
-        # Callback for messages from external client
-        def parse_header(payload):
-            start = 0
-            end = 4
-            topic_len, = struct.unpack('>I', payload[0:4])
-            start += 4
-            end += topic_len
-            topic, = struct.unpack('>%ss' % topic_len, payload[start:end])
-            start += topic_len
-            end += 4
-            mtype_len, = struct.unpack('>I', payload[start:end])
-            start += 4
-            end += mtype_len
-            mtype, = struct.unpack('>%ss' % mtype_len, payload[start:end])
-            # rospy.logdebug('%s %s %s %s' % (topic_len, topic, mtype_len, mtype))
-            return topic, mtype, payload[end:]        
-        cmd, = struct.unpack('>I', data[0:4])
-        payload = data[4:]
-        topic, mtype, msg = parse_header(payload)
-        
-        if cmd not in [Bridge.LOCAL_PUB, Bridge.LOCAL_SUB, Bridge.LOCAL_BRIDGE]:
-            rospy.logwarn('%s requested tasks on an external machine' % (addr, ))
-            return
-        self._deq.append((cmd, addr, topic, mtype, msg))
-
-    def service_request(self, req, resp, event):
-        self._deq.append((self.SERV_REQ, req, resp, event))
-    
-    def _local_topic_cb(self, msg, topic):
-        # Callback for messages from local master that we're subscribed to;
-        # only do this if we're not the ones publishing
-        if 'topic' not in msg._connection_header:
-            msg._connection_header['topic'] = topic
-        else:
-            assert msg._connection_header['topic'] == topic
-        if msg._connection_header['callerid'] != self._name:
-            self._deq.append((self.EXTERN_PUB, msg))
-
-    def _serv_ack_cb(self, success, addr, msg):
-        # Callback for service messages, which are acknowledged
-        self._deq.append((self.SERV_ACK, success, addr, msg))
-                
-    #============================== Processing ===============================#
-    # These should only get called by main loop
-
-    def _get_pub(self, topic, mtype, addr):
-        key = (topic, mtype)
-        if key not in self._publishers:
-            rospy.loginfo("Creating local publisher for %s (%s)  %s" % (
-                    topic, mtype, addr))
-            
-            mtype_cls = self._resolver.get_msg_class(mtype)
-            pub = SerializedPublisher(topic, mtype_cls)
-            self._publishers[key] = pub
-        return self._publishers[key]
-
-    def _add_sub(self, topic, mtype, addr):
-        # Ensure that addr receives mtype messages on topic
-        key = (topic, mtype)
-        if key not in self._subscriptions:
-            rospy.loginfo("Subscribing %s to %s (%s)" % (addr, topic, mtype))
-
-            mclass = self._resolver.get_msg_class(mtype)
-
-            clsname  = ''.join([mclass.__module__, '.', mclass.__name__])
-            if clsname not in self._classes:
-                # Create new class with special deserialize() method in local
-                # namespace.  Prepend base class' module name so that if the
-                # ROS names don't collide, neither will these.
-                cls = type(clsname, (mclass, ), {'deserialize': deserialize_noop})
-                self._classes[clsname] = cls
-            cls = self._classes[clsname]
-                
-            self._subscriptions[key] = (
-                rospy.Subscriber(topic, cls, lambda x: self._local_topic_cb(x, topic)), [addr])
-        else:
-            sub, addrs = self._subscriptions[key]
-            # TODO: verify that mtype matches
-            if addr not in addrs:
-                rospy.loginfo("Subscribing %s to %s (%s)" % (addr, topic, mtype))
-                addrs.append(addr)
-            else:
-                rospy.loginfo("%s is already subscribed to %s (%s)" % (
-                        addr, topic, mtype))
-    
-    def _serv_ack(self, success, addr, msg):
-        # Create local publisher if remote end ACK'ed our request
-        req = self._service_resps[addr].popleft()
-        if success:
-            if req.action == topic_bridge.srv.TopicRequest.BRIDGE:
-                self._get_pub(req.topic, req.mtype, addr)
-                self._add_sub(req.topic, req.mtype, addr)
-            if req.action == topic_bridge.srv.TopicRequest.SUBSCRIBE:
-                self._get_pub(req.topic, req.mtype, addr)
-        else:
-            # Retransmit message; append request to end of messages that are
-            # outgoing to addr.  This maintains the invariant that callbacks to
-            # _serv_ack pertain to the first item in the list at _service_resps
-            rospy.logwarn("Couldn't send %s\nretrying" % req)
-            self._service_resps[addr].append(req)
-            self._send(msg, [addr], 5.0, self._serv_ack_cb)
-    
-    def _service_request(self, req, resp, event):
-        good = (self._resolver.is_valid_mtype(req.mtype) and
-                len(req.topic) > 0)
-        try:
-            ip = socket.gethostbyname(req.ip)
-        except socket.gaierror:
-            good = False
-
-        act = {topic_bridge.srv.TopicRequest.SUBSCRIBE: Bridge.LOCAL_SUB,
-               topic_bridge.srv.TopicRequest.BRIDGE: Bridge.LOCAL_BRIDGE}
-        good = good and req.action in act
-            
-        if not good:
-            rospy.logwarn('Bad service request:\n%s' % req)
-            resp['resp'] = topic_bridge.srv.TopicResponse(success = False)
-            event.set()
-            return
-        
-        topic, mtype = req.topic, req.mtype
-        addr = (ip, req.port)
-        q = self._service_resps.setdefault(addr, collections.deque())
-        q.append(req)
-        enc = struct.pack('>II%ssI%ss' % (len(topic), len(mtype)),
-                          act[req.action], len(topic), topic, len(mtype),
-                          mtype)
-        self._send(enc, [addr], 5.0, self._serv_ack_cb)
-
-        resp['resp'] = topic_bridge.srv.TopicResponse(success = True)
-        event.set()
-    
-    def _extern_pub(self, msg):
-        # Publish a message on an external machine
-        mtype = msg._connection_header['type']
-        topic = msg._connection_header['topic']
-        key = (topic, mtype)
-        
-        # msg.serialize(buff)
-        # ser = buff.getvalue()
-        ser = msg.serialized
-        dests = self._subscriptions[key][1]
-
-        msg = struct.pack('>II%ssI%ss%ss' % (len(topic), len(mtype), len(ser)),
-                          Bridge.LOCAL_PUB, len(topic), topic, len(mtype), mtype, ser)
-        # rospy.logdebug("BRIDGE:: Received message on %s (%s).  Sending to %s",
-        #                topic, mtype, dests)
-        self._send(msg, dests)
-        
-    def _local_sub(self, addr, topic, mtype, msg):
-        # Subscribe to messages locally and send to external master
-        self._add_sub(topic, mtype, addr)
-        
-    def _local_pub(self, addr, topic, mtype, msg):
-        # Publish a message locally from an external master
-        smesg = SerializedMessage(msg)
-        # rospy.logdebug("Publishing on %s (%s)" % (topic, mtype))
-        
-        # If the publisher for this topic and mtype doesn't exist, _get_pub()
-        # will create it.  This can happen if if we asked an external master to
-        # send messages to us, we died, and then came back.
-        self._get_pub(topic, mtype, addr).publish_serialized(smesg)
-
-    def _local_bridge(self, addr, topic, mtype, msg):
-        # Create a bridge locally
-        self._add_sub(topic, mtype, addr)
-        self._get_pub(topic, mtype, addr)
-    
-    #=============================== Main loop ===============================#
-    def run(self, timeout = 0.5):
-        # Main event loop.  Get items off of queue and process them.
-        while not rospy.is_shutdown():
-            if len(self._deq) == 0:
-                time.sleep(0.01)
-                continue
-            items = self._deq.popleft()
-            key = items[0]
-            args = items[1:]
-
-            dispatch = {Bridge.EXTERN_PUB: self._extern_pub,
-                        Bridge.LOCAL_PUB: self._local_pub,
-                        Bridge.LOCAL_SUB: self._local_sub,
-                        Bridge.LOCAL_BRIDGE: self._local_bridge,                        
-                        Bridge.SERV_REQ: self._service_request,
-                        Bridge.SERV_ACK: self._serv_ack}
-
-            if key not in dispatch:
-                rospy.logwarn("Unknown type on Queue: %s" % type)
-            else:
-                dispatch[key](*args)
-
-class Client(object):
-    def __init__(self, addr):
-        self.addr = addr
-        # Sequence number of the item at the head of self._deq
-        self.seqno = -1
-        self.deq = collections.deque()
-        # Sequence number of the 
-        self.last_sent = 0
-        # Map from nonce to ChunkedMessage
-        self.chunked_messages = {}
-        # Nonces to ignore
-        self.black_list_expire = collections.deque()
-        self.black_list = set()
-        self.black_list_ttl = 10.0
-
-    def get_retransmit(self, retransmit_duration, purge_duration):
-        retransmit = []
-        for nonce, cmesg in self.chunked_messages.items():
-            now = time.time()
-            if nonce in self.black_list or (now - cmesg.started > purge_duration):
-                self.del_msg(nonce)
-            elif now - cmesg.last_added > retransmit_duration:
-                retransmit.append((nonce, cmesg))
-        # Check if any nonce's are OK to use again
-        while self.black_list_expire:
-            now = time.time()
-            nonce, started = self.black_list_expire[0]
-            if now - started > self.black_list_ttl:
-                self.black_list_expire.popleft()
-                self.black_list.remove(nonce)
-            else:
-                break
-        return retransmit
-
-    def get_or_create_chunk(self, nonce, total):
-        if nonce in self.black_list:
-            return None
-        elif nonce not in self.chunked_messages:
-            # rospy.loginfo("Creating chunked message nonce=%i" % nonce)
-            self.chunked_messages[nonce] = ChunkedMessage(nonce, total)
-        return self.chunked_messages[nonce]
-
-    def del_msg(self, nonce):
-        # rospy.loginfo("Removing chunked message nonce=%i, %s are missing" % (
-        #         (nonce, len(self.chunked_messages[nonce].remaining))))
-        del self.chunked_messages[nonce]
-        self.black_list.add(nonce)
-        self.black_list_expire.append((nonce, time.time()))
-
-# Messages requiring an Ack
-AckMsg = collections.namedtuple('AckMsg', ['cb', 'timeout', 'seqno', 'msg'])
-        
-class ChunkedMessage(object):
-    def __init__(self, nonce, total, chunks = None):
-        self.nonce = nonce
-        self.started = time.time()
-        self.last_added = 0
-        if chunks is None:
-            self.chunks = [None] * total
-            self.remaining = set(xrange(0, total))
-        else:
-            self.chunks = chunks
-            self.remaining = set([])
-            assert len(chunks) == total
-            
-    def add_chunk(self, ind, chunk):
-        self.remaining.discard(ind)
-        self.chunks[ind] = chunk
-        self.last_added = time.time()
-
-class UDPServer(asyncore.dispatcher):
-    NO_ACK = '\x00'
-    NEED_ACK = '\x01'
-    ACK = '\x02'
-    NO_ACK_CHUNK = '\x03'
-    RETRANSMIT = '\x04'
-    
-    def __init__(self, port):
-        asyncore.dispatcher.__init__(self)
-        self.create_socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.set_reuse_addr()
-        self.bind(('', port))
-        self._read_cb = lambda x: None
-
-        self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
-        self.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
-                                                            
-        # deque is a thread-safe object
-        
-        # Send messages via UDP with no additional guarantees
-        self._deq = collections.deque()
-        # Queue for requests to Client objects
-        self._fifo = collections.deque()
-        # Map from (IP, port) to Client() objects.
-        self._clients = {}
-        # Duration to wait before requesting a retransmit for recvd messages
-        self.retransmit_duration = 0.05
-        # Duration to wait before purging a partially recvd message
-        self.purge_duration = 3.0
-        # Sent messages that were chunked; maps from nonce to ChunkedMessage
-        self.sent_cache = {}
-        # Time to live of messages in sent_cache
-        self.sent_ttl = 5.0
-
-    def _get_or_create_client(self, addr):
-        host, port = addr
-        ip = socket.gethostbyname(host)
-        return self._clients.setdefault((ip, port), Client((ip, port)))
-
-    def _get_client(self, addr):
-        host, port = addr
-        ip = socket.gethostbyname(host)
-        return self._clients[(ip, port)]
-
-    def _read_need_ack(self, data, addr):
-        client = self._get_or_create_client(addr)
-        # rospy.logdebug("Got message from %s seqno=%s" % (
-        #         client.addr, seqno))
-        rospy.logdebug("Processing message")
-        self._read_cb(addr, data[5:])
-        # Send ACK with 4 bytes acknowleding that we've processed this
-        self.sendto(self.ACK + data[1:5], addr)
-
-    def _read_ack(self, data, addr):
-        # Acknowledge that we got an ACK
-        seqno, = struct.unpack('>I', data[1:5])
-        client = self._get_client(addr)
-
-        ackmsg = client.deq[0]
-        if ackmsg.seqno == seqno:
-            rospy.logdebug("Got ACK from %s on seqno=%i" % (
-                    client.addr, seqno))
-            if callable(ackmsg.cb):
-                ackmsg.cb(True, client.addr, ackmsg.msg)
-            client.deq.popleft()
-            client.last_sent = 0
-        elif client.seqno < seqno:
-            rospy.logwarn("Got an ACK with a larger than expected seqno")
-        else:
-            pass # Old sequence number
-
-    def _read_no_ack_chunk(self, data, addr):
-        nonce, total, ind = struct.unpack('>III', data[1:13])
-        chunk = data[13:]
-        client = self._get_or_create_client(addr)
-
-        cmesg = client.get_or_create_chunk(nonce, total)
-        if cmesg is None:
-            return
-        # rospy.loginfo("Adding chunk nonce = %i ind = %i from %s" % (
-        #         nonce, ind, client.addr))
-        cmesg.add_chunk(ind, chunk)
-        if len(cmesg.remaining) == 0:
-            # rospy.loginfo("Received all chunks for %i" % nonce)
-            comp = ''.join(cmesg.chunks)
-            msg = snappy.decompress(comp)
-            self._read_cb(addr, msg)
-            client.del_msg(nonce)
-
-    def _read_transmit(self, data, addr):
-        nonce, num = struct.unpack(">II", data[1:9])
-        inds = struct.unpack(">%sH" % num, data[9:])
-        # rospy.loginfo("Got a request to retransmit %s packets nonce = %i" %
-        #               (num, nonce))
-        if nonce not in self.sent_cache:
-            rospy.logwarn("Can't resubmit packets for nonce=%i, message purged" %
-                          nonce)
-        else:
-            cmesg = self.sent_cache[nonce]
-            # TODO: error checking on inds
-            for ind in inds:
-                payload = self.NO_ACK_CHUNK + cmesg.chunks[ind]
-                self.sendto(payload, addr)
-    
-    def handle_read(self):
-        # 64KB is max UDP packet size
-        data, addr = self.recvfrom(64 * 1024)
-        # rospy.loginfo("Got data from %s" % (addr, ))
-        if data[0] == self.NO_ACK_CHUNK:
-            self._read_no_ack_chunk(data, addr)
-        elif data[0] == self.NO_ACK:
-            # rospy.logdebug("NO ACK: %s", data[1:])
-            self._read_cb(addr, data[1:])
-        elif data[0] == self.NEED_ACK:
-            self._read_need_ack(data, addr)
-        elif data[0] == self.ACK:
-            self._read_ack(data, addr)
-        elif data[0] == self.RETRANSMIT:
-            self._read_transmit(data, addr)
-        else:
-            rospy.logwarn('Message with invalid header packet from %s' % (addr, ))
-
-    def _write_unreliable(self):
-        msg, addrs = self._deq.popleft()
-        if len(msg) > MTU:
-            comp = snappy.compress(msg)
-            total = int(math.ceil(len(comp) / float(MTU)))
-            nonce = random.randint(0, 2**32 - 1)
-            # rospy.loginfo("Sending %s bytes in %s messages nonce = %i ratio = %.2f" % (
-            #         len(comp), total, nonce, len(msg) / len(comp)))
-            header = struct.pack('>II', nonce, total)
-            chunks = [header + struct.pack('>I', ind) + bytearray(chunk)
-                      for ind, chunk in enumerate(chunker(comp, MTU))]
-            self.sent_cache[nonce] = ChunkedMessage(nonce, total, chunks)
-            for chunk in chunks:
-                payload = self.NO_ACK_CHUNK + chunk
-                for addr in addrs:
-                    self.sendto(payload, addr)
-        else:
-            # rospy.logdebug("UDP Server:: Sending data to %s" % addrs)
-            msg = self.NO_ACK + msg
-            for addr in addrs:
-                self.sendto(msg, addr)
-
-    def _write_reliable(self):
-        # Add new reliable messages to clients
-        msg, addrs, timeout, cb = self._fifo.popleft()
-        for addr in addrs:
-            clt = self._get_or_create_client(addr)
-            # rospy.logdebug("Enqueueing message for %s" % (clt.addr, ))
-            clt.seqno += 1
-            am = AckMsg(msg = msg, cb = cb, timeout = timeout, seqno = clt.seqno)
-            clt.deq.append(am)
-
-    def _write_client(self, clt):
-        retransmits = clt.get_retransmit(self.retransmit_duration,
-                                         self.purge_duration)
-        for nonce, cmesg in retransmits:
-            inds = list(cmesg.remaining)
-            # rospy.loginfo("Requesting %i packets from %s (nonce=%i)",
-            #               len(inds), clt.addr, nonce)
-            # Make sure each payload is below MTU
-            for chunk in chunker(inds, MTU / 2 - 9):
-                header = self.RETRANSMIT + struct.pack('>II', nonce, len(chunk))
-                payload = (header + struct.pack('>%sH' % len(chunk), *chunk))
-                self.sendto(payload, clt.addr)
-            # To ensure that we don't re-request packet several times, reset
-            # add time
-            cmesg.last_added = time.time()
-
-        # Nothing to do
-        if len(clt.deq) == 0:
-            return
-
-        ackmsg = clt.deq[0]
-        if clt.last_sent == 0:
-            # Send message
-            # rospy.loginfo("Sending message to %s seqno=%i" % (
-            #         clt.addr, ackmsg.seqno))
-            payload = (self.NEED_ACK + struct.pack('>I', ackmsg.seqno) +
-                       ackmsg.msg)
-            self.sendto(payload, clt.addr)
-            clt.last_sent = time.time()
-        elif time.time() - clt.last_sent > ackmsg.timeout:
-            # No ACK for message; drop it
-            if callable(ackmsg.cb):
-                ackmsg.cb(False, clt.addr, ackmsg.msg)
-            clt.deq.popleft()
-            # rospy.loginfo("Message to %s seqno=%i expired, drop it" % (
-            #         clt.addr, clt.seqno))
-            clt.last_sent = 0
-
-    def handle_write(self):
-        # Handle regular UDP
-        if len(self._deq) > 0:
-            self._write_unreliable()
-            
-        if len(self._fifo) > 0:
-            self._write_reliable()
-                
-        # Handle client needs
-        for clt in self._clients.values():
-            self._write_client(clt)
-
-        # Check if any chunked messages that we've sent need to be purged
-        for nonce, chunk in self.sent_cache.items():
-            if time.time() - chunk.started > self.sent_ttl:
-                # rospy.loginfo("Purging message nonce=%i" % nonce)
-                del self.sent_cache[nonce]
-                
-    def writable(self):
-        now = time.time()
-        rv = (len(self._deq) != 0 or
-              len(self._fifo) != 0 or
-              any(clt.get_retransmit(self.retransmit_duration, self.purge_duration) or
-                  (len(clt.deq) > 0 and
-                   (clt.last_sent == 0 or
-                    now - clt.last_sent > clt.deq[0].timeout))
-                  for clt in self._clients.values()))
-        return rv
-
-    def set_read_cb(self, cb):
-        self._read_cb = cb
-
-    def send_msg(self, payload, addrs, timeout = None, cb = None):
-        # Thread safe function to send bitstream to list of (IP, port) addrs
-        if timeout is None:
-            self._deq.append((payload, addrs))
-        else:
-            if len(payload) > MTU:
-                rospy.logwarn("Message is too big, ignoring")
+    def subscribe(self, ros_topic):
+        # Subscribe to a local ROS topic
+        with self._lock:
+            if ros_topic in self._subscribers:
+                self._log.info("Already subscribed to %s", ros_topic)
                 return
-            self._fifo.append((payload, addrs, timeout, cb))
+            self._log.info("Subscribing to ROS topic %s", ros_topic)
+            self._subscribers[ros_topic] = \
+                rospy.Subscriber(ros_topic, rospy.AnyMsg, self._recv,
+                                 callback_args = ros_topic)
 
-def chunker(iterable, chunksize):
-    """
-    Return elements from the iterable in `chunksize`-ed lists. The last returned
-    chunk may be smaller (if length of collection is not divisible by `chunksize`).
+    def publish(self, ros_topic, msg_type_str, msg_data):
+        # Publish a message via ROS
+        with self._lock:
+            if ros_topic not in self._publishers:
+                self._log.info("Publishing to ROS topic %s", ros_topic)
+                mtype_cls = self._resolver.get_msg_class(msg_type_str)
+                pub = rospy.Publisher(ros_topic, mtype_cls)
+                self._publishers[ros_topic] = pub
+            pub = self._publishers[ros_topic]
+            msg = rospy.AnyMsg()
+            msg._buff = msg_data
+            pub.publish(msg)
 
-    >>> print list(chunker(xrange(10), 3))
-    [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
-    """
-    i = iter(iterable)
-    while True:
-        wrapped_chunk = [list(itertools.islice(i, int(chunksize)))]
-        if not wrapped_chunk[0]:
-            break
-        yield wrapped_chunk.pop()
-            
-def handle_service(bridge, req):
-    resp = {'resp': None}
-    evt = threading.Event()
-    bridge.service_request(req, resp, evt)
-    evt.wait()
-    return resp['resp']
+    def on_recv(self, cb):
+        """
+        Register a callback to be run every time we receive a message on a
+        local ROS topic.
 
-def main(port, name):
-    rospy.init_node(name)
-    
-    bridge = Bridge(rospy.get_name())
-    server = UDPServer(port)
+        The callback will be given (topic, type_str, bytes)
+        """
+        self._local_recv_cb = cb
 
-    server.set_read_cb(bridge.recv_msg_cb)
+    def _recv(self, msg, topic):
+        if msg._connection_header['callerid'] != self._name:
+           self._local_recv_cb(topic, msg._connection_header['type'], msg._buff)
 
-    bridge.set_send(server.send_msg)
+class ForeignROS(object):
+    # This delimeter is used to delimit a hierarchy of ZMQ topics.  ROS topics,
+    # hostnames, IP addresses, and DNS names must not contain it. '-' prevents
+    # collision with ROS topics; '*' prevents colissions with net addresses.
+    ZMQ_DELIM = '-*-'
 
-    # Load configuration file if present
-    conf = rospy.get_param('~conf_file', None)
-    if conf:
-        rospy.loginfo("Loading config file %s" % conf)
-        my_ip = get_ip()
-        rospy.loginfo("My IP address is %s", my_ip)
-        convert = {'bridge': 1, 'subscribe': 0}
-        with open(conf) as f:
-            doc = yaml.load(f)
-        for addr, fields in doc.items():
-            ip, port = addr.split(':')
-            if my_ip == ip:
-                rospy.loginfo("Skipping myself in config file")
-                continue
-            port = int(port)
-            for topic, mtype, cmd in fields:
-                cmd = convert[cmd.lower()]
-                req = topic_bridge.srv.TopicRequest(action = cmd,
-                                                    ip = ip, port = port,
-                                                    mtype = mtype, topic = topic)
-                bridge.service_request(req, {}, threading.Event())
+    def __init__(self, my_addr, my_port, context, loop):
+        self._loop = loop
+        self._context = context
+        self._servers = None
+        self._log = logging.getLogger("foreign")
+        self._subscriber = self._context.socket(zmq.SUB)
+        self._subscriber = zmq.eventloop.zmqstream.ZMQStream(self._subscriber)
+        self._subscriber.linger = 0
+
+        self._publisher = self._context.socket(zmq.XPUB)
+        self._publisher = zmq.eventloop.zmqstream.ZMQStream(self._publisher)
+        self._publisher.linger = 0
+        self._my_addr = my_addr
+        self._publisher.bind("tcp://*:%d" % my_port)
+
+        self._publisher.on_recv(self._publisher_recv_cb)
+        self._subscriber.on_recv(self._subscriber_recv_cb)
+
+        self._servers = set()
+        self._topics = set()
+
+    def subscribe_topic(self, ros_topic):
+        validate_ros_topic(ros_topic)
+        cb = functools.partial(self._subscribe_topic, ros_topic = ros_topic)
+        self._loop.add_callback(cb)
+
+    def publish_topic(self, ros_topic):
+        validate_ros_topic(ros_topic)
+        cb = functools.partial(self._publish_topic, ros_topic = ros_topic)
+        self._loop.add_callback(cb)
+
+    def publish(self, ros_topic, msg_type, data):
+        # Send a message to all peers
+        # TODO: Validate msg_type
+        validate_ros_topic(ros_topic)
+        cb = functools.partial(self._publish, ros_topic = ros_topic,
+                               data = data, msg_type = msg_type)
+        self._loop.add_callback(cb)
+
+    def update_foreign_addrs(self, addrs):
+        cb = functools.partial(self._update_foreign_addrs, addrs = addrs)
+        self._loop.add_callback(cb)
+
+    def on_receive(self, cb):
+        # Receive callback will get called with data received from the
+        # subscriber (i.e., data from topics that you request be sent to you)
+        self._subscribe_receive_cb = cb
+
+    def on_request(self, cb):
+        # Request callback will be called when the remote end wants you to
+        # subscribe to data locally (i.e, you should create a subscriber and
+        # publish that data via publish)
+        self._subscribe_request_cb = cb
+
+    #=========================== Internal methods ============================#
+    # Nothing here is thread safe
+    def _update_foreign_addrs(self, addrs):
+        for addr in addrs:
+            if addr not in self._servers:
+                # Only update self._servers once we've connected without error
+                self._log.info("Connecting to remote %s", addr)
+                self._subscriber.connect("tcp://%s" % addr)
+                self._servers.add(addr)
+                self._subscriber.setsockopt(zmq.SUBSCRIBE, addr)
+
+    def _publisher_recv_cb(self, frames):
+        UNSUBSCRIBE = "\x00"
+        SUBSCRIBE = "\x01"
+        msg = frames[0]
+        status, zmq_topic = msg[0], msg[1:]
+        parts = zmq_topic.split(ForeignROS.ZMQ_DELIM)
+        if status not in (UNSUBSCRIBE, SUBSCRIBE):
+            self._log.error("Unknown subscription announcement: %r", msg)
+            return
+
+        if parts[0] == 'ros':
+            ros_topic = parts[1]
+            if not is_valid_ros_topic(ros_topic):
+                self._log.error("Remote wants bad ROS topic: %s", ros_topic)
+                return
+            if status == UNSUBSCRIBE:
+                pass
+            elif status == SUBSCRIBE:
+                self._log.info("Requesting subscription to %s", ros_topic)
+                self._subscribe_request_cb(ros_topic)
+        elif parts[0] == self._my_addr:
+            if status == UNSUBSCRIBE:
+                self._log.info("Someone left")
+            elif status == SUBSCRIBE:
+                self._log.info("New subscription to our announcements")
+                self._broadcast_topics()
+        elif parts[0] in self._servers:
+            # Ignore subscription for topic advertisements from other server
+            pass
+        else:
+            self._log.warn("Unhandled subscription type: %r", msg)
+
+    def _publish(self, ros_topic, msg_type, data):
+        zmq_topic = ForeignROS.ZMQ_DELIM.join(["ros", ros_topic])
+        self._publisher.send_multipart([zmq_topic, msg_type, data])
+
+    def _publish_topic(self, ros_topic):
+        if ros_topic not in self._topics:
+            self._log.info("Publishing ROS topic %s", ros_topic)
+            self._topics.add(ros_topic)
+            self._broadcast_topics()
+
+    def _broadcast_topics(self):
+        self._log.info("Broadcasting topics: %r", self._topics)
+        zmq_topic = self._my_addr
+        msg = [zmq_topic]
+        msg.extend(self._topics)
+        self._publisher.send_multipart(msg)
+
+    def _subscriber_recv_cb(self, frames):
+        parts = frames[0].split(ForeignROS.ZMQ_DELIM)
+        if parts[0] == 'ros':
+            ros_topic = parts[1]
+            msg_type = frames[1]
+            msg_data = frames[2]
+            self._subscribe_receive_cb(ros_topic, msg_type, msg_data)
+        elif parts[0] in self._servers:
+            for ros_topic in frames[1:]:
+                if not is_valid_ros_topic(ros_topic):
+                    self._log.warn("Remote %s broadcast bad topic %s, ignoring",
+                                   parts[0], ros_topic)
+                    continue
+                else:
+                    self._log.info("Remote %s is announcing topic %s",
+                                   parts[0], ros_topic)
+                    self._subscribe_topic(ros_topic)
+        else:
+            self._log.warn("Unrecognized topic: %r", frames[0])
+
+    def _subscribe_topic(self, ros_topic):
+        # NB: We will now get messages on this topic from *anyone* we've
+        # conntected to
+        zmq_topic = ForeignROS.ZMQ_DELIM.join(['ros', ros_topic])
+        self._log.info("Subscribing to %s", zmq_topic)
+        self._subscriber.setsockopt(zmq.SUBSCRIBE, zmq_topic)
+
+class TopicManager(object):
+    def __init__(self, local_ros, foreign_ros):
+        self._local = local_ros
+        self._foreign = foreign_ros
+
+        self._local.on_recv(self._foreign.publish)
+        self._foreign.on_receive(self._local.publish)
+        self._foreign.on_request(self._local.subscribe)
+
+    def update_foreign_addrs(self, others):
+        self._foreign.update_foreign_addrs(others)
+
+    def foreign_subscribe(self, topic):
+        """Subscribe to a topic published by any other ROS master.
+
+        Messages on this topic will be published on the local ROS instance."""
+        self._foreign.subscribe_topic(topic)
+
+    def foreign_publish(self, topic):
+        """Publish messages from a local topic to all other ROS masters."""
+        self._foreign.publish_topic(topic)
+        
+class ROSLoggingHandler(logging.Handler):
+    """A logging handler to broadcast messages via ROS' logging mechanism"""
+    loggers = {logging.DEBUG: rospy.logdebug,
+               logging.INFO: rospy.loginfo,
+               logging.WARN: rospy.logwarn,
+               logging.ERROR: rospy.logerr,
+               logging.FATAL: rospy.logfatal}
+
+    def emit(self, record):
+        msg = self.format(record)
+        try:
+            func = ROSLoggingHandler.loggers[record.levelno]
+        except Exception, e:
+            rospy.logerr("Error when looking up handler:%r\n\n%s", record, e)
+            return
+        func(msg)
+
+class Config(collections.namedtuple('Config',
+                                    'name ip port subscribe publish')):
+    def address(self):
+        assert self.port is not None
+        assert not all([self.name is None, self.ip is None])
+        if self.ip is None:
+            return '%s:%d' % (self.name, self.port)
+        else:
+            return '%s:%d' % (self.ip, self.port)
+
+def parse_yaml_conf(conf_path, default_port):
+    # TODO: detect repeat entries
+    configs = set()
+    machines = set()
+    with open(conf_path) as f:
+        doc = yaml.load(f)
+    for key, fields in doc.items():
+        if ':' in key:
+            addr, port = key.split(':')
+        else:
+            addr, port = key, default_port
+        port = int(port)
+
+        if is_ip(addr):
+            ip, name = addr, None
+        else:
+            ip, name = None, addr
+
+        subscribe = []
+        publish = []
+        if fields is not None:
+            if  'subscribe' in fields:
+                for topic in fields['subscribe']:
+                    if not is_valid_ros_topic(topic):
+                        rospy.logerr("Invalid topic in subscribe for %s: %s",
+                                     addr, topic)
+                        exit(-1)
+                    subscribe.append(topic)
+
+            if 'publish' in fields:
+                for topic in fields['publish']:
+                    if not is_valid_ros_topic(topic):
+                        rospy.logerr("Invalid topic in publish for %s: %r",
+                                     addr, topic)
+                        exit(-1)
+                    publish.append(topic)
+
+            diff = set(fields.keys()).difference(set(['publish', 'subscribe']))
+            if diff:
+                rospy.logwarn("Unused entries for %s: %s", addr, list(diff))
+
+        configs.add(Config(name, ip, port, tuple(subscribe), tuple(publish)))
+    return configs
+
+def find_my_config(configs, my_port):
+    def die(prefix):
+        rospy.logerr("%s: fqdn=%s hostname=%s ip=%s port=%r", prefix,
+                     my_fqdn[0], my_hostname[0], my_ip, my_port)
+        exit(-1)
+    my_fqdn = (socket.getfqdn(), my_port)
+    my_hostname = (socket.gethostname(), my_port)
+    my_ip, my_iface = get_ip()
+    my_addr = (my_ip, my_port)
+
+    addrs = dict(((conf.ip, conf.port), conf) for conf in configs if conf.ip)
+    names = dict(((cnf.name, cnf.port), cnf) for cnf in configs if cnf.name)
+    if my_hostname in names:
+        if my_addr in addrs:
+            die("Hostname and IP address are both in config")
+        elif my_fqdn != my_hostname and my_fqdn in names:
+            die("Distinct hostname and FQDN are both in config")
+        my_conf = names[my_hostname]
+    elif my_fqdn in names:
+        if my_addr in addrs:
+            die("FQDN and IP address are both in config")
+        my_conf = my_fqdn[my_fqdn]
+    elif my_addr in addrs:
+        my_conf = addrs[my_addr]
     else:
-        rospy.loginfo("Not loading a config file")
-    
-    server_thread = threading.Thread(target = lambda: asyncore.loop(timeout = 0.001))
-    server_thread.daemon = True
-    server_thread.start()
-    
+        die("Couldn't find configuration")
+    other_confs = [conf for conf in configs if conf != my_conf]
+    return my_conf, other_confs
 
-    srv = rospy.Service('~topic', topic_bridge.srv.Topic,
-                        lambda req: handle_service(bridge, req))
+def main():
+    rospy.init_node('topic_bridge', log_level = rospy.DEBUG,
+                    disable_signals = True)
 
-    bridge.run()
+    # Setup logging
+    fmt = "[%(name)s] %(message)s"
+    handler = ROSLoggingHandler()
+    handler.setFormatter(logging.Formatter(fmt))
+    logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger().addHandler(handler)
+
+    # Get configuration
+    default_port = 10000
+    my_port = rospy.get_param('~port', default_port)
+    conf = rospy.get_param('~config', None)
+    if conf is None:
+        rospy.logerror("No config file specified")
+        return
+    rospy.loginfo("Loading config %s" % conf)
+    configs = parse_yaml_conf(conf, default_port)
+    my_config, other_configs = find_my_config(configs, my_port)
+
+    # Create local and foreign pubsubs
+    local = LocalROS(rospy.get_name())
+    zmq_context = zmq.Context()
+    zmq_loop = zmq.eventloop.ioloop.IOLoop.instance()
+    foreign = ForeignROS(my_config.address(), my_config.port,
+                         zmq_context, zmq_loop)
+    manager = TopicManager(local, foreign)
+
+    # Register publish / subscribe
+    manager.update_foreign_addrs(conf.address() for conf in other_configs)
+    for sub in my_config.subscribe:
+        manager.foreign_subscribe(sub)
+    for pub in my_config.publish:
+        manager.foreign_publish(pub)
+
+    # Run!
+    try:
+        zmq_loop.start()
+    except KeyboardInterrupt:
+        rospy.signal_shutdown("Keyboard interrupt")
 
 if __name__ == "__main__":
-    import sys
-    port = int(sys.argv[1]) if sys.argv[1:] else 8080
-    name = sys.argv[2] if sys.argv[2:] else 'topic_bridge'
-    main(port, name)
+    main()
