@@ -92,7 +92,7 @@ class LocalROS(object):
 
         self._local_recv_cb = lambda topic, msg: None
 
-        self._log = logging.getLogger('local')
+        self._log = logging.getLogger('bridge.local')
 
     def subscribe(self, ros_topic):
         # Subscribe to a local ROS topic
@@ -144,7 +144,7 @@ class ForeignROS(object):
         self._loop = loop
         self._context = context
         self._servers = None
-        self._log = logging.getLogger("foreign")
+        self._log = logging.getLogger("bridge.foreign")
         self._subscriber = self._context.socket(zmq.SUB)
         self._subscriber = zmq.eventloop.zmqstream.ZMQStream(self._subscriber)
         self._subscriber.linger = 0
@@ -302,7 +302,7 @@ class TopicManager(object):
     def foreign_publish(self, topic):
         """Publish messages from a local topic to all other ROS masters."""
         self._foreign.publish_topic(topic)
-        
+
 class ROSLoggingHandler(logging.Handler):
     """A logging handler to broadcast messages via ROS' logging mechanism"""
     loggers = {logging.DEBUG: rospy.logdebug,
@@ -315,6 +315,26 @@ class ROSLoggingHandler(logging.Handler):
         msg = self.format(record)
         try:
             func = ROSLoggingHandler.loggers[record.levelno]
+        except Exception, e:
+            rospy.logerr("Error when looking up handler:%r\n\n%s", record, e)
+            return
+        func(msg)
+
+class RootLoggingHandler(logging.Handler):
+    """A logging handler to broadcast root messages via ROS"""
+    loggers = {logging.DEBUG: rospy.logdebug,
+               logging.INFO: rospy.loginfo,
+               logging.WARN: rospy.logwarn,
+               logging.ERROR: rospy.logerr,
+               logging.FATAL: rospy.logfatal}
+
+    def emit(self, record):
+        if record.name != 'root':
+            return
+
+        msg = self.format(record)
+        try:
+            func = RootLoggingHandler.loggers[record.levelno]
         except Exception, e:
             rospy.logerr("Error when looking up handler:%r\n\n%s", record, e)
             return
@@ -404,14 +424,18 @@ def find_my_config(configs, my_port):
     return my_conf, other_confs
 
 def main():
-    rospy.init_node('topic_bridge', log_level = rospy.DEBUG,
+    rospy.init_node('topic_bridge', log_level = logging.INFO,
                     disable_signals = True)
 
     # Setup logging
     fmt = "[%(name)s] %(message)s"
     handler = ROSLoggingHandler()
     handler.setFormatter(logging.Formatter(fmt))
-    logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger('bridge').setLevel(logging.INFO)
+    logging.getLogger('bridge').addHandler(handler)
+
+    handler = RootLoggingHandler()
+    handler.setFormatter(logging.Formatter(fmt))
     logging.getLogger().addHandler(handler)
 
     # Get configuration
@@ -419,7 +443,7 @@ def main():
     my_port = rospy.get_param('~port', default_port)
     conf = rospy.get_param('~config', None)
     if conf is None:
-        rospy.logerror("No config file specified")
+        rospy.logerr("~config paramter is undefined")
         return
     rospy.loginfo("Loading config %s" % conf)
     configs = parse_yaml_conf(conf, default_port)
