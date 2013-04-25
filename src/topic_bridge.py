@@ -7,6 +7,7 @@ import struct
 import fcntl
 import functools
 import collections
+import zlib
 
 import zmq
 import zmq.eventloop.ioloop
@@ -107,14 +108,16 @@ class LocalROS(object):
     def publish(self, ros_topic, msg_type_str, msg_data):
         # Publish a message via ROS
         with self._lock:
+            msg = rospy.AnyMsg()
+            decomp = zlib.decompress(msg_data)
+            msg._buff = decomp
+
             if ros_topic not in self._publishers:
                 self._log.info("Publishing to ROS topic %s", ros_topic)
                 mtype_cls = self._resolver.get_msg_class(msg_type_str)
                 pub = rospy.Publisher(ros_topic, mtype_cls)
                 self._publishers[ros_topic] = pub
             pub = self._publishers[ros_topic]
-            msg = rospy.AnyMsg()
-            msg._buff = msg_data
             pub.publish(msg)
 
     def on_recv(self, cb):
@@ -128,7 +131,8 @@ class LocalROS(object):
 
     def _recv(self, msg, topic):
         if msg._connection_header['callerid'] != self._name:
-           self._local_recv_cb(topic, msg._connection_header['type'], msg._buff)
+            comp = zlib.compress(msg._buff)
+            self._local_recv_cb(topic, msg._connection_header['type'], comp)
 
 class ForeignROS(object):
     # This delimeter is used to delimit a hierarchy of ZMQ topics.  ROS topics,
