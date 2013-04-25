@@ -17,6 +17,7 @@ import yaml
 
 import rospy
 import roslib; roslib.load_manifest('topic_bridge')
+import roslib.message
 import rosgraph.names
 
 def get_ip_address(ifname):
@@ -65,28 +66,12 @@ def validate_ros_topic(topic):
     if not is_valid_ros_topic(topic):
         raise ValueError("%s is not a valid global ROS topic" % topic)
 
-# Consider using roslib.message.get_message_class(topic_type) instead
-class ROSResolver(object):
-    def __init__(self):
-        self._msgs = {}
-
-    def get_msg_class(self, mtype):
-        pkg, cls = mtype.split('/')
-
-        if pkg not in self._msgs:
-            roslib.load_manifest(pkg)
-            self._msgs[pkg] = __import__('%s.msg' % pkg, fromlist = ['msg'])
-
-        return getattr(self._msgs[pkg], cls)
-
 class LocalROS(object):
     def __init__(self, name):
         self._name = name
         self._lock = threading.Lock()
         self._subscribers = {}
         self._publishers = {}
-        # Used to resolve ROS names; not thread safe
-        self._resolver = ROSResolver()
         # Map names of dynamiaclly created classes to the classes themselves
         self._classes = {}
 
@@ -114,7 +99,7 @@ class LocalROS(object):
 
             if ros_topic not in self._publishers:
                 self._log.info("Publishing to ROS topic %s", ros_topic)
-                mtype_cls = self._resolver.get_msg_class(msg_type_str)
+                mtype_cls = roslib.message.get_message_class(msg_type_str)
                 pub = rospy.Publisher(ros_topic, mtype_cls)
                 self._publishers[ros_topic] = pub
             pub = self._publishers[ros_topic]
