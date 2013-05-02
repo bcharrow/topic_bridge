@@ -1,7 +1,7 @@
 #+TITLE:     design.org
 #+AUTHOR:    Ben Charrow
 #+EMAIL:     bcharrow@seas.upenn.edu
-#+DATE:      2012-06-28 Thu
+#+DATE:      2013-05-02 Thu
 #+DESCRIPTION: Design goals for topic_bridge
 #+KEYWORDS: 
 #+LANGUAGE:  en
@@ -20,37 +20,19 @@ not use the same ROS master.
 
 Each ROS master should have a single topic\_bridge node. The node listens to
 specified topics via ROS' communication infrastructure, and sends messages it
-receives to other topic\_bridge nodes on other ROS masters via UDP.  Upon
-receiving a message from a foreign topic\_bridge, the local topic\_bridge will
-broadcast the message locally via ROS' communication infrastructure.
-
-Bridges can be one way or two way.  A one way bridge between two computers
-would mean one machine sends its local messages to the other computer, but the
-reverse does not happen.  Bridges are configured on a per-topic basis.
-
-* Usage
- Assuming you have a topic\_bridge running on local master.
-
- Get messages from 192.168.130.27:8080/test forwarded to local machine.
- : rosservice call /topic_bridge/topic "{ip: '192.168.130.27', port: 8080, 
- :   mtype: 'std_msgs/String', topic: '/test'}"
-
- Send / get messages between localhost and 192.168.130.27:8080 (2-way bridge)
- : rosservice call /topic_bridge/topic "{ip: '192.168.130.27', port: 808,0hi 
- :   mtype: 'std_msgs/String', topic: '/test', action: 1}"
+receives to other topic\_bridge nodes on other ROS masters via 0MQs publish /
+subscribe sockets.  Upon receiving a message from a foreign topic\_bridge, the
+local topic\_bridge will broadcast the message locally via ROS' communication
+infrastructure.
 
 * Design notes
 
-- Because UDP is the transport protocol for communication between bridges,
-  messages may arrive out of order or not at all.
+- Requires 0MQ version 3.
 - ROS parameters are not supported.
 - ROS services are not supported.
 - Assumes synchronized clocks between machines.
 - No service discovery.
-- Everything is implemented using rospy.  roscpp is difficult to use because it
-  has no introspection and it would require compile time specification of
-  supported types.  See ros::Subscriber, ros::Publisher,
-  ros::NodeHandle::advertise() and ros::AdvertiseOptions for more details.
+- Everything is implemented using rospy.
 
 * Mesh notes
 I've measured the following on a mesh 802.11S network using the Scarabs.
